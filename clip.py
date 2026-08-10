@@ -1,45 +1,66 @@
 import os
 import subprocess
 import gdown
-from pyrogram import Client
+from pyrogram import Client, filters
 
-# Environment variables se data lena
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-API_ID = os.environ.get("API_ID")
+# GitHub Secrets se variables import kar rahe hain
+API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = int(os.environ.get("CHAT_ID"))
 
-GDRIVE_LINK = os.environ.get("GDRIVE_LINK")
-START_TIME = os.environ.get("START_TIME")
-END_TIME = os.environ.get("END_TIME")
+app = Client("clipper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Ye bot sirf aapki CHAT_ID par respond karega
+@app.on_message(filters.command("start") & filters.chat(CHAT_ID))
+def start(client, message):
+    message.reply_text(
+        "✅ GitHub Action Bot Online Hai!\n\n"
+        "Command format:\n"
+        "`/cut [GDRIVE_LINK] [START_TIME] [END_TIME]`\n\n"
+        "Example:\n"
+        "`/cut https://drive.google.com/file/d/... 00:01:00 00:02:30`"
+    )
 
-def process_video():
-    print("Downloading from GDrive...")
-    input_file = "movie.mp4"
-    output_file = "clip.mp4"
+@app.on_message(filters.command("cut") & filters.chat(CHAT_ID))
+def cut_video(client, message):
+    args = message.text.split()
+    if len(args) != 4:
+        message.reply_text("❌ Format: `/cut [LINK] [START] [END]`")
+        return
+
+    gdrive_link, start_time, end_time = args[1], args[2], args[3]
+    msg = message.reply_text("📥 GDrive se movie download ho rahi hai...")
     
-    # GDrive se download
-    gdown.download(GDRIVE_LINK, input_file, fuzzy=True)
+    input_file = "input.mp4"
+    output_file = "output.mp4"
+    
+    # Purani files clear karna
+    if os.path.exists(input_file): os.remove(input_file)
+    if os.path.exists(output_file): os.remove(output_file)
 
-    print(f"Clipping video from {START_TIME} to {END_TIME}...")
-    # FFmpeg se quality loss ke bina cut karna (-c copy)
-    command = [
-        "ffmpeg", "-i", input_file, 
-        "-ss", START_TIME, "-to", END_TIME, 
-        "-c", "copy", output_file
-    ]
-    subprocess.run(command)
+    try:
+        # Gdown se file fetch karna
+        gdown.download(url=gdrive_link, output=input_file, quiet=False, fuzzy=True)
+        msg.edit_text("✂️ Download complete! FFmpeg se clip cut ho rahi hai (Zero Quality Loss)...")
 
-    print("Uploading to Telegram...")
-    with app:
-        app.send_video(
-            chat_id=CHAT_ID,
-            video=output_file,
-            caption=f"✂️ Clip from {START_TIME} to {END_TIME}",
-            supports_streaming=True
-        )
+        # FFmpeg stream copy process
+        cmd = ["ffmpeg", "-ss", start_time, "-to", end_time, "-i", input_file, "-c", "copy", output_file]
+        subprocess.run(cmd, check=True)
+
+        msg.edit_text("📤 Clip ready! Telegram par upload ho rahi hai...")
+        
+        # Telegram par final output bhejna
+        client.send_video(chat_id=message.chat.id, video=output_file, supports_streaming=True)
+        msg.delete()
+
+    except Exception as e:
+        msg.edit_text(f"❌ Error: {e}")
+    finally:
+        # Storage free karna
+        if os.path.exists(input_file): os.remove(input_file)
+        if os.path.exists(output_file): os.remove(output_file)
 
 if __name__ == "__main__":
-    process_video()
+    print("Bot Started via GitHub Actions...")
+    app.run()
