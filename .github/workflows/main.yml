@@ -1,0 +1,35 @@
+name: Video Clipper Runner
+
+on:
+  repository_dispatch:
+    types: [start_clipping] # Yeh aage chal kar Cloudflare se trigger hoga
+
+jobs:
+  process-video:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install FFmpeg & Python Libraries
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+        pip install pyrogram tgcrypto gdown
+
+    - name: Run Clipper Script
+      env:
+        BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        API_ID: ${{ secrets.API_ID }}
+        API_HASH: ${{ secrets.API_HASH }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+        GDRIVE_LINK: ${{ github.event.client_payload.gdrive_link }}
+        START_TIME: ${{ github.event.client_payload.start_time }}
+        END_TIME: ${{ github.event.client_payload.end_time }}
+      run: python clip.py
