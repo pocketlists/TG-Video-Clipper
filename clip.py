@@ -1,74 +1,72 @@
-import os
+Import os
 import subprocess
 import gdown
-from pyrogram import Client
+from pyrogram import Client, filters
 
 # GitHub Secrets
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-API_ID = os.environ.get("API_ID")
+API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
-CHAT_ID = int(os.environ.get("CHAT_ID"))
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# Cloudflare Variables
-GDRIVE_LINK = os.environ.get("GDRIVE_LINK")
-TIMESTAMPS = os.environ.get("TIMESTAMPS")
+app = Client("clipper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+@app.on_message(filters.command("start"))
+def start(client, message):
+    message.reply_text(
+        "✅ Bot Online Hai!\n\n"
+        "Format: `/cut [LINK] [START] [END]`"
+    )
 
-def process_video():
-    # Error Fix: Agar link nahi mila toh crash nahi hoga
-    if not GDRIVE_LINK or not TIMESTAMPS:
-        print("❌ Error: Link ya Timestamps nahi mile! Kripya command Telegram se bhejein, GitHub se manually run na karein.")
+@app.on_message(filters.command("cut"))
+def cut_video(client, message):
+    args = message.text.split()
+    if len(args) != 4:
+        message.reply_text("❌ Format: `/cut [LINK] [START] [END]`")
         return
 
-    print("📥 GDrive se movie download ho rahi hai...")
+    gdrive_link, start_time, end_time = args[1], args[2], args[3]
+    msg = message.reply_text("📥 GDrive se movie download ho rahi hai (Isme thoda time lag sakta hai)...")
+    
     input_file = "input.mp4"
+    output_file = "output.mp4"
     
-    # Naya Smart GDrive Logic
-    if "/d/" in GDRIVE_LINK:
-        file_id = GDRIVE_LINK.split("/d/")[1].split("/")[0]
-        download_url = f"https://drive.google.com/uc?id={file_id}"
-    else:
-        download_url = GDRIVE_LINK
+    if os.path.exists(input_file): os.remove(input_file)
+    if os.path.exists(output_file): os.remove(output_file)
 
-    gdown.download(url=download_url, output=input_file, quiet=False)
+    try:
+        # GDrive link se exact ID nikal kar direct link banana (Fuzzy ki zarurat nahi)
+        if "/d/" in gdrive_link:
+            file_id = gdrive_link.split("/d/")[1].split("/")[0]
+            download_url = f"https://drive.google.com/uc?id={file_id}"
+        else:
+            download_url = gdrive_link
 
-    if not os.path.exists(input_file):
-        print("❌ Download fail ho gaya! Link check karein.")
-        return
+        # Update: fuzzy=True hata diya gaya hai
+        gdown.download(url=download_url, output=input_file, quiet=False)
+        
+        if not os.path.exists(input_file):
+            msg.edit_text("❌ Download fail ho gaya! Link check karein ya make sure public hai.")
+            return
 
-    timestamps_list = TIMESTAMPS.split(",")
-    
-    with app:
-        for idx, ts in enumerate(timestamps_list):
-            if "-" not in ts:
-                continue
-            
-            start_time, end_time = ts.split("-")
-            output_file = f"clip_{idx+1}.mp4"
-            
-            print(f"✂️ Clipping {idx+1}: {start_time} to {end_time}...")
-            command = [
-                "ffmpeg", "-i", input_file, 
-                "-ss", start_time, "-to", end_time, 
-                "-c", "copy", output_file
-            ]
-            subprocess.run(command, check=True)
+        msg.edit_text("✂️ Download complete! FFmpeg se clip cut ho rahi hai (Zero Quality Loss)...")
 
-            print(f"📤 Uploading clip {idx+1} to Telegram...")
-            app.send_video(
-                chat_id=CHAT_ID,
-                video=output_file,
-                caption=f"✂️ Batch Clip {idx+1}: {start_time} to {end_time}",
-                supports_streaming=True
-            )
-            
-            if os.path.exists(output_file): 
-                os.remove(output_file)
-                
-    if os.path.exists(input_file): 
-        os.remove(input_file)
-    print("✅ All processing completed!")
+        # FFmpeg zero loss cut
+        cmd = ["ffmpeg", "-ss", start_time, "-to", end_time, "-i", input_file, "-c", "copy", output_file]
+        subprocess.run(cmd, check=True)
+
+        msg.edit_text("📤 Clip ready! Telegram par upload ho rahi hai...")
+        
+        client.send_video(chat_id=message.chat.id, video=output_file, supports_streaming=True)
+        msg.delete()
+
+    except Exception as e:
+        msg.edit_text(f"❌ Error: {e}")
+    finally:
+        # Storage safai
+        if os.path.exists(input_file): os.remove(input_file)
+        if os.path.exists(output_file): os.remove(output_file)
 
 if __name__ == "__main__":
-    process_video()
+    print("Bot Started via GitHub Actions...", flush=True)
+    app.run()
+
