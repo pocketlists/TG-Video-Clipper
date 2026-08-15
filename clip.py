@@ -1,4 +1,4 @@
-Import os
+import os
 import subprocess
 import gdown
 from pyrogram import Client, filters
@@ -69,4 +69,3 @@ def cut_video(client, message):
 if __name__ == "__main__":
     print("Bot Started via GitHub Actions...", flush=True)
     app.run()
-
