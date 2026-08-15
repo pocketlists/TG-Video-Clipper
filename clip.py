@@ -25,30 +25,37 @@ def cut_video(client, message):
         return
 
     gdrive_link, start_time, end_time = args[1], args[2], args[3]
-    msg = message.reply_text("📥 GDrive se movie download ho rahi hai (Isme thoda time lag sakta hai)...")
     
     input_file = "input.mp4"
     output_file = "output.mp4"
     
-    if os.path.exists(input_file): os.remove(input_file)
+    # Update: Yahan se input file delete karne wali line hata di gayi hai.
+    # Ab naye command par sirf purani output (clip) delete hogi.
     if os.path.exists(output_file): os.remove(output_file)
 
+    msg = message.reply_text("⏳ Processing shuru ho rahi hai...")
+
     try:
-        # GDrive link se exact ID nikal kar direct link banana (Fuzzy ki zarurat nahi)
-        if "/d/" in gdrive_link:
-            file_id = gdrive_link.split("/d/")[1].split("/")[0]
-            download_url = f"https://drive.google.com/uc?id={file_id}"
-        else:
-            download_url = gdrive_link
-
-        # Update: fuzzy=True hata diya gaya hai
-        gdown.download(url=download_url, output=input_file, quiet=False)
-        
+        # Smart Logic: Agar movie pehle se mojud nahi hai, tabhi download hogi
         if not os.path.exists(input_file):
-            msg.edit_text("❌ Download fail ho gaya! Link check karein ya make sure public hai.")
-            return
+            msg.edit_text("📥 GDrive se movie download ho rahi hai (Isme thoda time lag sakta hai)...")
+            
+            # GDrive link se exact ID nikal kar direct link banana
+            if "/d/" in gdrive_link:
+                file_id = gdrive_link.split("/d/")[1].split("/")[0]
+                download_url = f"https://drive.google.com/uc?id={file_id}"
+            else:
+                download_url = gdrive_link
 
-        msg.edit_text("✂️ Download complete! FFmpeg se clip cut ho rahi hai (Zero Quality Loss)...")
+            gdown.download(url=download_url, output=input_file, quiet=False)
+            
+            if not os.path.exists(input_file):
+                msg.edit_text("❌ Download fail ho gaya! Link check karein ya make sure public hai.")
+                return
+        else:
+            msg.edit_text("✅ Movie pehle se system mein hai! Seedha clip cut kar rahe hain...")
+
+        msg.edit_text("✂️ FFmpeg se clip cut ho rahi hai (Zero Quality Loss)...")
 
         # FFmpeg zero loss cut
         cmd = ["ffmpeg", "-ss", start_time, "-to", end_time, "-i", input_file, "-c", "copy", output_file]
@@ -62,10 +69,9 @@ def cut_video(client, message):
     except Exception as e:
         msg.edit_text(f"❌ Error: {e}")
     finally:
-        # Storage safai
-        if os.path.exists(input_file): os.remove(input_file)
+        # Storage safai - Update: Ab aakhiri mein sirf output clip delete hogi, main movie safe rahegi!
         if os.path.exists(output_file): os.remove(output_file)
 
 if __name__ == "__main__":
-    print("Bot Started via GitHub Actions...", flush=True)
+    print("Bot Started...", flush=True)
     app.run()
