@@ -2,8 +2,8 @@
 """
 One-Time Manga Recap Video Renderer (Telegram)
 -----------------------------------------------
-Run karo, Telegram se ZIP wait karo, video banao, bhejo, exit ho jao.
-24/7 bot nahi hai – sirf jab aap chahe tab chalega.
+Bot start hote hi owner ko message bhejta hai.
+ZIP (images) bhejo -> story/audio bhejo -> video banega.
 """
 
 import os
@@ -34,6 +34,7 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")  # <-- naya variable
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -50,6 +51,7 @@ if not OPENAI_API_KEY or not GEMINI_API_KEY:
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("gemini-3.5-flash-lite")
+
 # ----------------------------
 # Work Directories
 # ----------------------------
@@ -73,13 +75,31 @@ app = Client(
 )
 
 # ----------------------------
+# Startup Message (bot start hote hi)
+# ----------------------------
+@app.on_startup()
+async def startup_message(client):
+    if OWNER_CHAT_ID:
+        try:
+            await client.send_message(
+                chat_id=OWNER_CHAT_ID,
+                text="✅ **Bot is running!**\n\nAb aapko sirf ye karna hai:\n1️⃣ Pehle **ZIP file** bhejo (sirf images, folder ki zaroorat nahi)\n2️⃣ Phir **story.txt** ya **script.txt** bhejo\n3️⃣ (Optional) **bgm.mp3** ya koi bhi audio bhejo\n\nVideo ban kar yahin mil jayegi! 🎬"
+            )
+            logger.info("Startup message sent to owner.")
+        except Exception as e:
+            logger.warning(f"Could not send startup message: {e}")
+    else:
+        logger.warning("OWNER_CHAT_ID not set, no startup message sent.")
+
+# ----------------------------
 # Utility Functions
 # ----------------------------
 def ensure_work_dirs():
     for d in [INPUT_PANELS_DIR, TEMP_DIR, OUTPUT_DIR]:
         d.mkdir(parents=True, exist_ok=True)
     for f in TEMP_DIR.glob("*"):
-        if f.is_file(): f.unlink()
+        if f.is_file():
+            f.unlink()
 
 def cleanup_work_dir():
     shutil.rmtree(WORK_DIR, ignore_errors=True)
@@ -103,7 +123,7 @@ def retry_with_backoff(max_retries=3, initial_delay=2.0, backoff_factor=2.0):
     return decorator
 
 # ----------------------------
-# Pipeline Functions (Same as before)
+# Pipeline Functions
 # ----------------------------
 class ScriptGenerator:
     def __init__(self, provider="gemini"):
@@ -408,51 +428,97 @@ def run_pipeline(workdir: Path) -> Path:
     assemble_final_video(sync_data, audio_file, bgm_file, output_mp4)
     return output_mp4
 
-# Global variable for waiting
-waiting_for_zip = False
-work_dir_path = None
+# ----------------------------
+# Smart Sequential File Handler
+# ----------------------------
+waiting_for_files = False
+current_work_dir = None
+
+@app.on_message(filters.command("start"))
+async def start_handler(client, message):
+    await message.reply_text(
+        "✅ **Bot is running!**\n\n"
+        "Ab aapko sirf ye karna hai:\n"
+        "1️⃣ Pehle **ZIP file** bhejo (sirf images, folder ki zaroorat nahi)\n"
+        "2️⃣ Phir **story.txt** ya **script.txt** bhejo\n"
+        "3️⃣ (Optional) **bgm.mp3** ya koi bhi audio bhejo\n\n"
+        "Video ban kar yahin mil jayegi! 🎬"
+    )
 
 @app.on_message(filters.document & filters.private)
-async def handle_file(client, message):
-    global waiting_for_zip, work_dir_path
+async def handle_docs(client, message):
+    global waiting_for_files, current_work_dir
     doc = message.document
+    file_name = doc.file_name
 
-    # Agar ZIP aaya
-    if doc.file_name.lower().endswith(".zip"):
+    # 1. ZIP file received
+    if file_name.lower().endswith(".zip"):
         cleanup_work_dir()
-        work_dir_path = WORK_DIR
-        work_dir_path.mkdir(parents=True, exist_ok=True)
-        
+        current_work_dir = WORK_DIR
+        current_work_dir.mkdir(parents=True, exist_ok=True)
+
         status_msg = await message.reply_text("📥 ZIP download ho rahi hai...")
-        zip_path = work_dir_path / "upload.zip"
+        zip_path = current_work_dir / "upload.zip"
         await client.download_media(message, file_name=str(zip_path))
-        
+
         await status_msg.edit_text("📂 Extract ho raha hai...")
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(work_dir_path)
+            zip_ref.extractall(current_work_dir)
         zip_path.unlink()
-        
-        if not (work_dir_path / "input_panels").exists():
-            await status_msg.edit_text("❌ ZIP mein 'input_panels' folder nahi mila! Ab story.txt bhejo ya dobara ZIP bhejo.")
-            return
-        
-        waiting_for_zip = True
-        await status_msg.edit_text("✅ Images mil gayi! Ab **story.txt** ya **script.txt** file bhejo. (BGM bhejna ho toh bhej do)")
 
-    # Agar story ya audio file aayi
-    elif waiting_for_zip and work_dir_path and doc.file_name.lower().endswith((".txt", ".mp3", ".wav")):
-        file_path = work_dir_path / doc.file_name
+        # --- SMART IMAGE DETECTION (Bina folder wali images) ---
+        panels_dir = current_work_dir / "input_panels"
+        if not panels_dir.exists():
+            await status_msg.edit_text("🔍 'input_panels' nahi mila, images dhundh raha hoon...")
+            
+            all_files = list(current_work_dir.rglob("*"))
+            found_images = [f for f in all_files if f.is_file() and f.suffix.lower() in [".jpg", ".jpeg", ".png"]]
+            
+            if not found_images:
+                await status_msg.edit_text("❌ ZIP mein koi bhi image file nahi mili!")
+                import os
+                os._exit(1)
+                return
+            
+            panels_dir.mkdir(parents=True, exist_ok=True)
+            for img in found_images:
+                if img.parent != panels_dir:
+                    shutil.move(str(img), str(panels_dir / img.name))
+            
+            await status_msg.edit_text(f"✅ {len(found_images)} images mili, 'input_panels' mein daal di!")
+        # --- SMART IMAGE DETECTION END ---
+
+        waiting_for_files = True
+        await status_msg.edit_text("✅ Images ready! Ab **story.txt** ya **script.txt** bhejo. (BGM/audio bhi chalega)")
+
+    # 2. Baaki files (story, script, audio) received after ZIP
+    elif waiting_for_files and current_work_dir:
+        file_path = current_work_dir / file_name
         await client.download_media(message, file_name=str(file_path))
         
-        # Check if all files are there
-        has_story = (work_dir_path / "story.txt").exists() or (work_dir_path / "script.txt").exists()
-        has_audio = (work_dir_path / "voiceover.mp3").exists() or (work_dir_path / "voiceover.wav").exists()
+        # Smart Rename: Agar .txt hai toh story.txt naam de do
+        if file_name.endswith(".txt") and file_name not in ["story.txt", "script.txt"]:
+            new_path = current_work_dir / "story.txt"
+            os.rename(file_path, new_path)
+            file_path = new_path
         
+        # Smart Rename: Agar koi bhi audio hai (bgm ke alawa) toh voiceover naam de do
+        elif file_name.lower().endswith((".mp3", ".wav", ".m4a")):
+            if file_name != "bgm.mp3" and file_name != "bgm.wav":
+                ext = Path(file_name).suffix
+                new_path = current_work_dir / f"voiceover{ext}"
+                os.rename(file_path, new_path)
+                file_path = new_path
+
+        # Check karo ki story ya voiceover aa gayi ya nahi
+        has_story = (current_work_dir / "story.txt").exists() or (current_work_dir / "script.txt").exists()
+        has_audio = (current_work_dir / "voiceover.mp3").exists() or (current_work_dir / "voiceover.wav").exists() or (current_work_dir / "voiceover.m4a").exists()
+
         if has_story or has_audio:
-            waiting_for_zip = False
-            status_msg = await message.reply_text("🎬 Sab files mil gayi! Video generation shuru...")
+            waiting_for_files = False
+            status_msg = await message.reply_text("🎬 Saari files mil gayi! Video generation shuru (5-10 min)...")
             try:
-                output_video = run_pipeline(work_dir_path)
+                output_video = run_pipeline(current_work_dir)
                 await client.send_video(
                     chat_id=message.chat.id,
                     video=str(output_video),
@@ -461,17 +527,18 @@ async def handle_file(client, message):
                 )
                 await status_msg.delete()
             except Exception as e:
+                logger.exception("Pipeline error")
                 await status_msg.edit_text(f"❌ Error: {e}")
             finally:
                 cleanup_work_dir()
                 import os
                 os._exit(0)
         else:
-            await message.reply_text("✅ Story file mil gayi! Ab BGM ya audio bhejo, ya bas 'DONE' likho.")
+            await message.reply_text("✅ File mil gayi! Ab story.txt aur audio (agar hai) bhejo, ya end karne ke liye bas 'DONE' likho.")
 
 # ----------------------------
 # Entry Point
 # ----------------------------
 if __name__ == "__main__":
-    print("🤖 One-Time Bot started. ZIP file bhejo...")
+    print("🤖 One-Time Bot started. Owner ko message bheja jayega...")
     app.run()
