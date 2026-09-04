@@ -1,29 +1,23 @@
-name: Manga Video Cloud Renderer
+name: One-Time Manga Video Renderer (Bot Wait)
 
 on:
-  workflow_dispatch:
-    inputs:
-      file_url:
-        description: 'Telegram Zip File URL'
-        required: true
-      chat_id:
-        description: 'Telegram Chat ID to send video back'
-        required: true
+  workflow_dispatch:  # Manual trigger
 
 jobs:
-  build-video:
+  run-bot:
     runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+    timeout-minutes: 360  # Max 6 hours (enough time to send ZIP)
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install FFmpeg (System Requirement)
+      - name: Install FFmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
@@ -31,36 +25,15 @@ jobs:
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install python-dotenv pydub google-generativeai openai requests Pillow
+          pip install -r requirements.txt
 
-      - name: Download and Extract ZIP from Telegram
-        run: |
-          echo "Downloading ZIP..."
-          curl -s -L "${{ github.event.inputs.file_url }}" -o manga_data.zip
-          echo "Extracting ZIP..."
-          unzip -o manga_data.zip -d ./
-          rm manga_data.zip
-
-      - name: Run AI Video Agent
+      - name: Run One-Time Bot
         env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SARVAM_API_KEY: ${{ secrets.SARVAM_API_KEY }}
         run: |
-          python manga_recap_agent.py
-
-      - name: Send Final Video back to Telegram
-        if: success()
-        run: |
-          echo "Uploading Video to Telegram..."
-          curl -F document=@"output/final_manga_recap.mp4" \
-               -F chat_id="${{ github.event.inputs.chat_id }}" \
-               -F caption="🎉 Yeh rahi tumhari Final AI Manga Video!" \
-               "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendDocument"
-
-      - name: Send Error Message to Telegram
-        if: failure()
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
-               -d chat_id="${{ github.event.inputs.chat_id }}" \
-               -d text="❌ Bhai, Cloud server par rendering fail ho gayi! GitHub Actions ke logs check karo."
+          python one_time_bot.py
