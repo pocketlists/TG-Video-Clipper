@@ -548,21 +548,40 @@ class ImageProcessor:
             z, x, y = "min(zoom+0.0015,1.5)", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
         return f"zoompan=z='{z}':x='{x}':y='{y}':{d}:{s}:{fps_str}"
 
-def standardize_image(self, image_path, output_path):
-    cmd = [
-        "ffmpeg", "-y", "-i", str(image_path),
-        "-filter_complex",
-        # Pad removes odd dimensions, Boxblur reduced to safer radius
-        "[0:v]split=2[bg][fg];"
-        "[bg]scale=1920:1080:force_original_aspect_ratio=increase,"
-        "crop=1920:1080,pad=1920:1080:0:0:color=black,boxblur=10:5[bgblur];"
-        "[fg]scale=1920:1080:force_original_aspect_ratio=decrease,"
-        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2[fgpad];"
-        "[bgblur][fgpad]overlay=(W-w)/2:(H-h)/2[out]",
-        "-frames:v", "1",
-        str(output_path)
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    # ✅ Fixed standardize_image (Error 234 wala fix)
+    def standardize_image(self, image_path, output_path):
+        cmd = [
+            "ffmpeg", "-y", "-i", str(image_path),
+            "-filter_complex",
+            "[0:v]split=2[bg][fg];"
+            "[bg]scale=1920:1080:force_original_aspect_ratio=increase,"
+            "crop=1920:1080,pad=1920:1080:0:0:color=black,boxblur=10:5[bgblur];"
+            "[fg]scale=1920:1080:force_original_aspect_ratio=decrease,"
+            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2[fgpad];"
+            "[bgblur][fgpad]overlay=(W-w)/2:(H-h)/2[out]",
+            "-frames:v", "1",
+            str(output_path)
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+
+    # ✅ Ye method bhi is class ke andar hi hona chahiye!
+    def create_clip(self, image_path, output_path, duration, effect):
+        logger.info(f"  → Effect: {effect} on {image_path.name}")
+        standardized = TEMP_DIR / f"std_{image_path.stem}.png"
+        self.standardize_image(image_path, standardized)
+        filter_str = self.generate_zoompan_filter(effect, duration, self.fps)
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", str(standardized),
+            "-filter_complex", f"[0:v]{filter_str}[v]",
+            "-map", "[v]",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "21",
+            "-t", str(duration),
+            "-pix_fmt", "yuv420p",
+            str(output_path)
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        standardized.unlink(missing_ok=True)
 
     def create_clip(self, image_path, output_path, duration, effect):
         logger.info(f"  → Effect: {effect} on {image_path.name}")
