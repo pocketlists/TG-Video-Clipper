@@ -2,8 +2,7 @@
 """
 One-Time Manga Recap Video Renderer (Telegram)
 -----------------------------------------------
-Bot start hote hi owner (CHAT_ID) ko message bhejta hai (agar sahi hai).
-ZIP (images) bhejo -> story/audio bhejo -> video banega.
+Bot start hota hai aur wait karta hai. Aap ZIP bhejo -> process hoga.
 """
 
 import os
@@ -35,7 +34,6 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_CHAT_ID = os.getenv("CHAT_ID")  # Use CHAT_ID from secrets
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -66,7 +64,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ----------------------------
-# Pyrogram Client (One-Time)
+# Pyrogram Client
 # ----------------------------
 app = Client(
     "one_time_bot",
@@ -74,22 +72,6 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
-
-# ----------------------------
-# Startup Logic (Non-fatal)
-# ----------------------------
-async def send_startup_message():
-    if OWNER_CHAT_ID:
-        try:
-            await app.send_message(
-                chat_id=OWNER_CHAT_ID,
-                text="✅ **Bot is running!**\n\nAb aapko sirf ye karna hai:\n1️⃣ Pehle **ZIP file** bhejo (sirf images, folder ki zaroorat nahi)\n2️⃣ Phir **story.txt** ya **script.txt** bhejo\n3️⃣ (Optional) **bgm.mp3** ya koi bhi audio bhejo\n\nVideo ban kar yahin mil jayegi! 🎬"
-            )
-            logger.info("Startup message sent to owner.")
-        except Exception as e:
-            logger.warning(f"Could not send startup message (check CHAT_ID): {e}")
-    else:
-        logger.warning("CHAT_ID not set, no startup message sent.")
 
 # ----------------------------
 # Utility Functions
@@ -123,7 +105,7 @@ def retry_with_backoff(max_retries=3, initial_delay=2.0, backoff_factor=2.0):
     return decorator
 
 # ----------------------------
-# Pipeline Functions (Same as before)
+# Pipeline Functions
 # ----------------------------
 class ScriptGenerator:
     def __init__(self, provider="gemini"):
@@ -537,13 +519,12 @@ async def handle_docs(client, message):
             await message.reply_text("✅ File mil gayi! Ab story.txt aur audio (agar hai) bhejo, ya end karne ke liye bas 'DONE' likho.")
 
 # ----------------------------
-# Main Entry Point (Fixed for Pyrogram v2)
+# Main Entry Point (No startup message)
 # ----------------------------
 async def main():
-    print("🤖 One-Time Bot started. Owner ko message bheja jayega...")
+    print("🤖 Bot started. Ab aap Telegram par ZIP file bhej sakte ho...")
     await app.start()
-    await send_startup_message()  # Non-fatal, will log warning if fails
-    # Keep bot running indefinitely until os._exit(0) is called
+    # Bot ab bas wait karega. Jab aap kuch bhi bhejoge, process hoga.
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
