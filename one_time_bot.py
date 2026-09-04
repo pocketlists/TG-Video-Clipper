@@ -2,7 +2,7 @@
 """
 One-Time Manga Recap Video Renderer (Telegram)
 -----------------------------------------------
-Bot start hote hi owner (CHAT_ID) ko message bhejta hai.
+Bot start hote hi owner (CHAT_ID) ko message bhejta hai (agar sahi hai).
 ZIP (images) bhejo -> story/audio bhejo -> video banega.
 """
 
@@ -14,7 +14,7 @@ import subprocess
 import shutil
 import time
 import zipfile
-import asyncio  # <-- Added for async startup
+import asyncio
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from functools import wraps
@@ -35,7 +35,7 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_CHAT_ID = os.getenv("CHAT_ID")  # <-- Fixed to CHAT_ID
+OWNER_CHAT_ID = os.getenv("CHAT_ID")  # Use CHAT_ID from secrets
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -76,7 +76,7 @@ app = Client(
 )
 
 # ----------------------------
-# Startup Logic (No on_startup decorator)
+# Startup Logic (Non-fatal)
 # ----------------------------
 async def send_startup_message():
     if OWNER_CHAT_ID:
@@ -87,7 +87,7 @@ async def send_startup_message():
             )
             logger.info("Startup message sent to owner.")
         except Exception as e:
-            logger.warning(f"Could not send startup message: {e}")
+            logger.warning(f"Could not send startup message (check CHAT_ID): {e}")
     else:
         logger.warning("CHAT_ID not set, no startup message sent.")
 
@@ -123,7 +123,7 @@ def retry_with_backoff(max_retries=3, initial_delay=2.0, backoff_factor=2.0):
     return decorator
 
 # ----------------------------
-# Pipeline Functions
+# Pipeline Functions (Same as before)
 # ----------------------------
 class ScriptGenerator:
     def __init__(self, provider="gemini"):
@@ -537,14 +537,14 @@ async def handle_docs(client, message):
             await message.reply_text("✅ File mil gayi! Ab story.txt aur audio (agar hai) bhejo, ya end karne ke liye bas 'DONE' likho.")
 
 # ----------------------------
-# Main Entry Point (Fixed Startup)
+# Main Entry Point (Fixed for Pyrogram v2)
 # ----------------------------
 async def main():
     print("🤖 One-Time Bot started. Owner ko message bheja jayega...")
     await app.start()
-    await send_startup_message()  # <-- Message bhejne ke liye
-    await app.idle()
-    await app.stop()
+    await send_startup_message()  # Non-fatal, will log warning if fails
+    # Keep bot running indefinitely until os._exit(0) is called
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
