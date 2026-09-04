@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Manga/Manhwa Recap Video Generator - Telegram Bot
--------------------------------------------------
-User ZIP file bhejta hai (images, script/audio, prompts, bgm).
-Bot usse extract karke video banata hai aur wapas bhejta hai.
+One-Time Manga Recap Video Renderer (Telegram)
+-----------------------------------------------
+Run karo, Telegram se ZIP wait karo, video banao, bhejo, exit ho jao.
+24/7 bot nahi hai – sirf jab aap chahe tab chalega.
 """
 
 import os
@@ -15,7 +15,7 @@ import shutil
 import time
 import zipfile
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Optional, Tuple
 from functools import wraps
 
 import requests
@@ -25,16 +25,15 @@ from PIL import Image
 import google.generativeai as genai
 from openai import OpenAI
 from pyrogram import Client, filters
-from pyrogram.types import Message
 
 # ----------------------------
-# Environment Setup
+# Load Environment Variables
 # ----------------------------
 load_dotenv()
 
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -45,12 +44,16 @@ if not all([API_ID, API_HASH, BOT_TOKEN]):
 if not OPENAI_API_KEY or not GEMINI_API_KEY:
     raise ValueError("OPENAI_API_KEY aur GEMINI_API_KEY bhi chahiye!")
 
-# APIs initialize
+# ----------------------------
+# Initialize APIs
+# ----------------------------
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
-# Base directories
+# ----------------------------
+# Work Directories
+# ----------------------------
 BASE_DIR = Path(__file__).parent
 WORK_DIR = BASE_DIR / "work"
 INPUT_PANELS_DIR = WORK_DIR / "input_panels"
@@ -61,28 +64,29 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ----------------------------
-# Pyrogram Bot Client
+# Pyrogram Client (One-Time)
 # ----------------------------
-app = Client("manga_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client(
+    "one_time_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
 # ----------------------------
 # Utility Functions
 # ----------------------------
-def ensure_work_dirs() -> None:
-    """Work directories banata hai aur temp saaf karta hai."""
+def ensure_work_dirs():
     for d in [INPUT_PANELS_DIR, TEMP_DIR, OUTPUT_DIR]:
         d.mkdir(parents=True, exist_ok=True)
     for f in TEMP_DIR.glob("*"):
-        if f.is_file():
-            f.unlink()
-    logger.info("✅ Work directories ready.")
+        if f.is_file(): f.unlink()
 
-def cleanup_work_dir() -> None:
-    """Poora work directory delete karke fresh banata hai."""
+def cleanup_work_dir():
     shutil.rmtree(WORK_DIR, ignore_errors=True)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-def retry_with_backoff(max_retries: int = 3, initial_delay: float = 2.0, backoff_factor: float = 2.0):
+def retry_with_backoff(max_retries=3, initial_delay=2.0, backoff_factor=2.0):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -100,43 +104,30 @@ def retry_with_backoff(max_retries: int = 3, initial_delay: float = 2.0, backoff
     return decorator
 
 # ----------------------------
-# Pipeline Functions (same as before)
+# Pipeline Functions (Same as before)
 # ----------------------------
 class ScriptGenerator:
-    def __init__(self, provider: str = "gemini"):
-        self.provider = provider.lower()
-        if self.provider == "gemini":
+    def __init__(self, provider="gemini"):
+        self.provider = provider
+        if provider == "gemini":
             self.model = genai.GenerativeModel("gemini-1.5-flash")
-        elif self.provider == "openai":
-            pass
-        else:
-            raise ValueError("Provider must be 'gemini' or 'openai'")
 
     @retry_with_backoff()
     def generate_full_script(self, raw_text: str) -> str:
         prompt = f"""
         You are a professional manga/manhwa recap scriptwriter.
         Given the raw story text below, create a dramatic, engaging narration script.
-        The script will be used as voiceover for a recap video.
         Write in natural spoken language, 2-4 minutes worth of narration.
         Do not include any formatting, just plain text paragraphs.
 
         Raw story:
         {raw_text}
         """
-        if self.provider == "gemini":
-            response = self.model.generate_content(prompt)
-            return response.text.strip()
-        else:
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-            )
-            return response.choices[0].message.content.strip()
+        response = self.model.generate_content(prompt)
+        return response.text.strip()
 
 @retry_with_backoff()
-def generate_tts(text: str, output_path: Path) -> None:
+def generate_tts(text: str, output_path: Path):
     logger.info("🎙️ AI Voiceover generate ho raha hai...")
     if SARVAM_API_KEY:
         try:
@@ -150,6 +141,7 @@ def generate_tts(text: str, output_path: Path) -> None:
                 return
         except Exception as e:
             logger.warning(f"Sarvam fail: {e}, OpenAI fallback...")
+
     response = openai_client.audio.speech.create(
         model="tts-1",
         voice="onyx",
@@ -173,6 +165,7 @@ def get_whisper_segments(audio_path: Path) -> List[Dict]:
             timestamp_granularities=["segment"]
         )
     segments = transcript.segments
+
     srt_path = TEMP_DIR / "subtitles.srt"
     with open(srt_path, "w", encoding="utf-8") as srt:
         for i, seg in enumerate(segments):
@@ -190,7 +183,7 @@ def format_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 @retry_with_backoff()
-def smart_sync_with_gemini(segments: List[Dict], image_files: List[str], prompts_text: str) -> List[Dict]:
+def smart_sync_with_gemini(segments, image_files, prompts_text):
     logger.info("🧠 Gemini AI sync kar raha hai...")
     segment_data = [{"id": i, "start": s["start"], "end": s["end"], "text": s["text"]} for i, s in enumerate(segments)]
     prompt = f"""
@@ -211,6 +204,7 @@ def smart_sync_with_gemini(segments: List[Dict], image_files: List[str], prompts
     if content.startswith("```"):
         content = content.split("\n", 1)[1].rsplit("```", 1)[0]
     sync_data = json.loads(content)
+
     last_effect = None
     for item in sync_data:
         available = [e for e in EFFECTS if e != last_effect]
@@ -227,14 +221,14 @@ EFFECTS = [
 ]
 
 class ImageProcessor:
-    def __init__(self, fps: int = 30):
+    def __init__(self, fps=30):
         self.fps = fps
 
-    def get_image_dimensions(self, image_path: Path) -> Tuple[int, int]:
+    def get_image_dimensions(self, image_path):
         with Image.open(image_path) as img:
             return img.size
 
-    def choose_effect(self, image_path: Path, previous_effect: Optional[str] = None) -> str:
+    def choose_effect(self, image_path, previous_effect=None):
         width, height = self.get_image_dimensions(image_path)
         is_vertical = height > width * 1.2
         is_horizontal = width > height * 1.2
@@ -248,7 +242,7 @@ class ImageProcessor:
             candidates.remove(previous_effect)
         return random.choice(candidates)
 
-    def generate_zoompan_filter(self, effect: str, duration: float, fps: int) -> str:
+    def generate_zoompan_filter(self, effect, duration, fps):
         total_frames = int(duration * fps)
         d = f"d={total_frames}"
         s = "s=1920x1080"
@@ -281,7 +275,7 @@ class ImageProcessor:
             z, x, y = "min(zoom+0.0015,1.5)", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
         return f"zoompan=z='{z}':x='{x}':y='{y}':{d}:{s}:{fps_str}"
 
-    def standardize_image(self, image_path: Path, output_path: Path) -> None:
+    def standardize_image(self, image_path, output_path):
         cmd = [
             "ffmpeg", "-y", "-i", str(image_path),
             "-filter_complex",
@@ -296,7 +290,7 @@ class ImageProcessor:
         ]
         subprocess.run(cmd, check=True, capture_output=True)
 
-    def create_clip(self, image_path: Path, output_path: Path, duration: float, effect: str) -> None:
+    def create_clip(self, image_path, output_path, duration, effect):
         logger.info(f"  → Effect: {effect} on {image_path.name}")
         standardized = TEMP_DIR / f"std_{image_path.stem}.png"
         self.standardize_image(image_path, standardized)
@@ -314,7 +308,7 @@ class ImageProcessor:
         subprocess.run(cmd, check=True, capture_output=True)
         standardized.unlink(missing_ok=True)
 
-def assemble_final_video(sync_data: List[Dict], audio_path: Path, bgm_path: Optional[Path], output_path: Path) -> None:
+def assemble_final_video(sync_data, audio_path, bgm_path, output_path):
     logger.info("🎬 Final assembly shuru...")
     img_proc = ImageProcessor()
     clip_paths = []
@@ -363,12 +357,15 @@ def assemble_final_video(sync_data: List[Dict], audio_path: Path, bgm_path: Opti
         raise RuntimeError("Final render failed!")
     logger.info(f"🎉 Video ready: {output_path.name}")
 
-# ----------------------------
-# Main Pipeline Runner
-# ----------------------------
-def run_pipeline() -> Path:
-    """Extracted work directory se video banata hai aur output path return karta hai."""
+def run_pipeline(workdir: Path) -> Path:
+    global WORK_DIR, INPUT_PANELS_DIR, TEMP_DIR, OUTPUT_DIR
+    WORK_DIR = workdir
+    INPUT_PANELS_DIR = WORK_DIR / "input_panels"
+    TEMP_DIR = WORK_DIR / "temp_workspace"
+    OUTPUT_DIR = WORK_DIR / "output"
+
     ensure_work_dirs()
+
     prompts_file = WORK_DIR / "prompts.txt"
     bgm_file = WORK_DIR / "bgm.mp3"
     audio_file = TEMP_DIR / "voiceover.wav"
@@ -376,13 +373,12 @@ def run_pipeline() -> Path:
 
     prompts_text = prompts_file.read_text(encoding="utf-8") if prompts_file.exists() else "No extra context."
 
-    # List images
     images = [f.name for f in INPUT_PANELS_DIR.glob("*.*") if f.suffix.lower() in [".jpg", ".jpeg", ".png"]]
     if not images:
         raise FileNotFoundError("input_panels folder khali hai! Images daalo.")
     logger.info(f"🖼️ Total images: {len(images)}")
 
-    # Hybrid audio logic
+    # Hybrid audio
     custom_audio_found = False
     for ext in [".mp3", ".wav", ".m4a"]:
         possible = WORK_DIR / f"voiceover{ext}"
@@ -414,37 +410,20 @@ def run_pipeline() -> Path:
     return output_mp4
 
 # ----------------------------
-# Telegram Bot Handlers
+# Telegram Handler (One-Time)
 # ----------------------------
-@app.on_message(filters.command("start"))
-async def start_command(client: Client, message: Message):
-    await message.reply_text(
-        "👋 **Namaste! Main Manga Recap Video Generator Bot hoon.**\n\n"
-        "📦 Mujhe ek **ZIP file** bhejo jisme ye structure ho:\n"
-        "```\n"
-        "input_panels/\n"
-        "  001.jpg\n"
-        "  002.png\n"
-        "  ...\n"
-        "script.txt   (ya voiceover.mp3)\n"
-        "prompts.txt  (optional)\n"
-        "bgm.mp3      (optional)\n"
-        "```\n"
-        "Main isse extract karke cinematic recap video banaunga aur wapas bhej dunga! 🎬"
-    )
-
-@app.on_message(filters.document)
-async def handle_zip(client: Client, message: Message):
+@app.on_message(filters.document & filters.private)
+async def handle_zip(client, message):
     doc = message.document
     if not doc.file_name.lower().endswith(".zip"):
         await message.reply_text("❌ Sirf ZIP file bhejo!")
         return
 
-    # Clean previous work
+    # Clean and prepare work dir
     cleanup_work_dir()
     WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-    status_msg = await message.reply_text("📥 ZIP file download ho rahi hai...")
+    status_msg = await message.reply_text("📥 ZIP download ho rahi hai...")
     zip_path = WORK_DIR / "upload.zip"
     await client.download_media(message, file_name=str(zip_path))
 
@@ -454,19 +433,19 @@ async def handle_zip(client: Client, message: Message):
             zip_ref.extractall(WORK_DIR)
         zip_path.unlink()
 
-        # Verify structure
         if not (WORK_DIR / "input_panels").exists():
             await status_msg.edit_text("❌ ZIP mein 'input_panels' folder nahi mila!")
+            await app.stop()
             return
 
-        await status_msg.edit_text("🎬 Video generation shuru ho rahi hai... (5-10 min lag sakte hain)")
-        output_video = run_pipeline()
+        await status_msg.edit_text("🎬 Video generation shuru... (5-10 min lag sakte hain)")
+        output_video = run_pipeline(WORK_DIR)
 
         await status_msg.edit_text("📤 Video upload ho rahi hai...")
         await client.send_video(
             chat_id=message.chat.id,
             video=str(output_video),
-            caption="✅ Ye raha aapka recap video!",
+            caption="✅ Aapka recap video ready!",
             supports_streaming=True
         )
         await status_msg.delete()
@@ -474,14 +453,14 @@ async def handle_zip(client: Client, message: Message):
         logger.exception("Pipeline error")
         await status_msg.edit_text(f"❌ Error: {e}")
     finally:
-        # Cleanup
-        if zip_path.exists():
-            zip_path.unlink(missing_ok=True)
+        # Cleanup work dir
         cleanup_work_dir()
+        # Stop the bot after handling
+        await app.stop()
 
 # ----------------------------
-# Bot Start
+# Entry Point
 # ----------------------------
 if __name__ == "__main__":
-    print("🤖 Bot Started...")
+    print("🤖 One-Time Bot started. ZIP file bhejo...")
     app.run()
