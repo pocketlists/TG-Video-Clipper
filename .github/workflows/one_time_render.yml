@@ -1,12 +1,12 @@
 name: One-Time Manga Video Renderer (Bot Wait)
 
 on:
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # Max 6 hours (enough time to send ZIP)
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Repository
@@ -35,6 +35,5 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SARVAM_API_KEY: ${{ secrets.SARVAM_API_KEY }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
           python one_time_bot.py
