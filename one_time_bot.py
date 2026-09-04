@@ -2,7 +2,7 @@
 """
 One-Time Manga Recap Video Renderer (Telegram)
 -----------------------------------------------
-Bot start hote hi owner ko message bhejta hai.
+Bot start hote hi owner (CHAT_ID) ko message bhejta hai.
 ZIP (images) bhejo -> story/audio bhejo -> video banega.
 """
 
@@ -14,6 +14,7 @@ import subprocess
 import shutil
 import time
 import zipfile
+import asyncio  # <-- Added for async startup
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from functools import wraps
@@ -34,7 +35,7 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")  # <-- naya variable
+OWNER_CHAT_ID = os.getenv("CHAT_ID")  # <-- Fixed to CHAT_ID
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -75,13 +76,12 @@ app = Client(
 )
 
 # ----------------------------
-# Startup Message (bot start hote hi)
+# Startup Logic (No on_startup decorator)
 # ----------------------------
-@app.on_startup()
-async def startup_message(client):
+async def send_startup_message():
     if OWNER_CHAT_ID:
         try:
-            await client.send_message(
+            await app.send_message(
                 chat_id=OWNER_CHAT_ID,
                 text="✅ **Bot is running!**\n\nAb aapko sirf ye karna hai:\n1️⃣ Pehle **ZIP file** bhejo (sirf images, folder ki zaroorat nahi)\n2️⃣ Phir **story.txt** ya **script.txt** bhejo\n3️⃣ (Optional) **bgm.mp3** ya koi bhi audio bhejo\n\nVideo ban kar yahin mil jayegi! 🎬"
             )
@@ -89,7 +89,7 @@ async def startup_message(client):
         except Exception as e:
             logger.warning(f"Could not send startup message: {e}")
     else:
-        logger.warning("OWNER_CHAT_ID not set, no startup message sent.")
+        logger.warning("CHAT_ID not set, no startup message sent.")
 
 # ----------------------------
 # Utility Functions
@@ -537,8 +537,14 @@ async def handle_docs(client, message):
             await message.reply_text("✅ File mil gayi! Ab story.txt aur audio (agar hai) bhejo, ya end karne ke liye bas 'DONE' likho.")
 
 # ----------------------------
-# Entry Point
+# Main Entry Point (Fixed Startup)
 # ----------------------------
-if __name__ == "__main__":
+async def main():
     print("🤖 One-Time Bot started. Owner ko message bheja jayega...")
-    app.run()
+    await app.start()
+    await send_startup_message()  # <-- Message bhejne ke liye
+    await app.idle()
+    await app.stop()
+
+if __name__ == "__main__":
+    asyncio.run(main())
