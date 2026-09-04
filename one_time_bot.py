@@ -2,7 +2,7 @@
 """
 One-Time Manga Recap Video Renderer (Telegram)
 -----------------------------------------------
-Bot start hota hai aur wait karta hai. Aap ZIP bhejo -> process hoga.
+Bot start hota hai, ZIP wait karta hai. File aate hi process karega.
 """
 
 import os
@@ -13,7 +13,6 @@ import subprocess
 import shutil
 import time
 import zipfile
-import asyncio
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from functools import wraps
@@ -105,7 +104,7 @@ def retry_with_backoff(max_retries=3, initial_delay=2.0, backoff_factor=2.0):
     return decorator
 
 # ----------------------------
-# Pipeline Functions
+# Pipeline Functions (Same as before)
 # ----------------------------
 class ScriptGenerator:
     def __init__(self, provider="gemini"):
@@ -411,7 +410,7 @@ def run_pipeline(workdir: Path) -> Path:
     return output_mp4
 
 # ----------------------------
-# Smart Sequential File Handler
+# Smart Sequential File Handler (with debug)
 # ----------------------------
 waiting_for_files = False
 current_work_dir = None
@@ -432,6 +431,9 @@ async def handle_docs(client, message):
     global waiting_for_files, current_work_dir
     doc = message.document
     file_name = doc.file_name
+
+    # Debug print - check if handler is called
+    print(f"📩 DEBUG: File received - {file_name}")
 
     # 1. ZIP file received
     if file_name.lower().endswith(".zip"):
@@ -519,13 +521,8 @@ async def handle_docs(client, message):
             await message.reply_text("✅ File mil gayi! Ab story.txt aur audio (agar hai) bhejo, ya end karne ke liye bas 'DONE' likho.")
 
 # ----------------------------
-# Main Entry Point (No startup message)
+# Main Entry Point (app.run is standard and reliable)
 # ----------------------------
-async def main():
-    print("🤖 Bot started. Ab aap Telegram par ZIP file bhej sakte ho...")
-    await app.start()
-    # Bot ab bas wait karega. Jab aap kuch bhi bhejoge, process hoga.
-    await asyncio.Event().wait()
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    print("🤖 Bot starting... /start command bhejo ya seedha ZIP bhejo.")
+    app.run()  # This keeps the bot running and processing updates
