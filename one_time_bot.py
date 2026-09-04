@@ -408,54 +408,66 @@ def run_pipeline(workdir: Path) -> Path:
     assemble_final_video(sync_data, audio_file, bgm_file, output_mp4)
     return output_mp4
 
-# ----------------------------
-# Telegram Handler (One-Time)
-# ----------------------------
+# Global variable for waiting
+waiting_for_zip = False
+work_dir_path = None
+
 @app.on_message(filters.document & filters.private)
-async def handle_zip(client, message):
+async def handle_file(client, message):
+    global waiting_for_zip, work_dir_path
     doc = message.document
-    if not doc.file_name.lower().endswith(".zip"):
-        await message.reply_text("❌ Sirf ZIP file bhejo!")
-        return
 
-    # Clean and prepare work dir
-    cleanup_work_dir()
-    WORK_DIR.mkdir(parents=True, exist_ok=True)
-
-    status_msg = await message.reply_text("📥 ZIP download ho rahi hai...")
-    zip_path = WORK_DIR / "upload.zip"
-    await client.download_media(message, file_name=str(zip_path))
-
-    try:
+    # Agar ZIP aaya
+    if doc.file_name.lower().endswith(".zip"):
+        cleanup_work_dir()
+        work_dir_path = WORK_DIR
+        work_dir_path.mkdir(parents=True, exist_ok=True)
+        
+        status_msg = await message.reply_text("📥 ZIP download ho rahi hai...")
+        zip_path = work_dir_path / "upload.zip"
+        await client.download_media(message, file_name=str(zip_path))
+        
         await status_msg.edit_text("📂 Extract ho raha hai...")
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(WORK_DIR)
+            zip_ref.extractall(work_dir_path)
         zip_path.unlink()
-
-        if not (WORK_DIR / "input_panels").exists():
-            await status_msg.edit_text("❌ ZIP mein 'input_panels' folder nahi mila!")
-            await app.stop()
+        
+        if not (work_dir_path / "input_panels").exists():
+            await status_msg.edit_text("❌ ZIP mein 'input_panels' folder nahi mila! Ab story.txt bhejo ya dobara ZIP bhejo.")
             return
+        
+        waiting_for_zip = True
+        await status_msg.edit_text("✅ Images mil gayi! Ab **story.txt** ya **script.txt** file bhejo. (BGM bhejna ho toh bhej do)")
 
-        await status_msg.edit_text("🎬 Video generation shuru... (5-10 min lag sakte hain)")
-        output_video = run_pipeline(WORK_DIR)
-
-        await status_msg.edit_text("📤 Video upload ho rahi hai...")
-        await client.send_video(
-            chat_id=message.chat.id,
-            video=str(output_video),
-            caption="✅ Aapka recap video ready!",
-            supports_streaming=True
-        )
-        await status_msg.delete()
-    except Exception as e:
-        logger.exception("Pipeline error")
-        await status_msg.edit_text(f"❌ Error: {e}")
-    finally:
-        # Cleanup work dir
-        cleanup_work_dir()
-        # Stop the bot after handling
-        await app.stop()
+    # Agar story ya audio file aayi
+    elif waiting_for_zip and work_dir_path and doc.file_name.lower().endswith((".txt", ".mp3", ".wav")):
+        file_path = work_dir_path / doc.file_name
+        await client.download_media(message, file_name=str(file_path))
+        
+        # Check if all files are there
+        has_story = (work_dir_path / "story.txt").exists() or (work_dir_path / "script.txt").exists()
+        has_audio = (work_dir_path / "voiceover.mp3").exists() or (work_dir_path / "voiceover.wav").exists()
+        
+        if has_story or has_audio:
+            waiting_for_zip = False
+            status_msg = await message.reply_text("🎬 Sab files mil gayi! Video generation shuru...")
+            try:
+                output_video = run_pipeline(work_dir_path)
+                await client.send_video(
+                    chat_id=message.chat.id,
+                    video=str(output_video),
+                    caption="✅ Aapka recap video ready!",
+                    supports_streaming=True
+                )
+                await status_msg.delete()
+            except Exception as e:
+                await status_msg.edit_text(f"❌ Error: {e}")
+            finally:
+                cleanup_work_dir()
+                import os
+                os._exit(0)
+        else:
+            await message.reply_text("✅ Story file mil gayi! Ab BGM ya audio bhejo, ya bas 'DONE' likho.")
 
 # ----------------------------
 # Entry Point
