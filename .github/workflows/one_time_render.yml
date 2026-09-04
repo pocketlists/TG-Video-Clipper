@@ -35,5 +35,6 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SARVAM_API_KEY: ${{ secrets.SARVAM_API_KEY }}
+          OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}   # <-- ye line add ki hai
         run: |
           python one_time_bot.py
