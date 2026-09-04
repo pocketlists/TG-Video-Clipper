@@ -35,6 +35,6 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SARVAM_API_KEY: ${{ secrets.SARVAM_API_KEY }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}   # <-- Changed from OWNER_CHAT_ID to CHAT_ID
+          CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
           python one_time_bot.py
