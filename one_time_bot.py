@@ -49,8 +49,7 @@ if not OPENAI_API_KEY or not GEMINI_API_KEY:
 # ----------------------------
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-
+gemini_model = genai.GenerativeModel("gemini-3.5-flash-lite")
 # ----------------------------
 # Work Directories
 # ----------------------------
