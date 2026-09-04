@@ -81,8 +81,8 @@ SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 # GitHub secret OWNER_CHAT_ID mein daal do.
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
 
-GEMINI_SYNC_MODEL = os.getenv("GEMINI_SYNC_MODEL", "gemini-2.5-flash-lite")
-GEMINI_SCRIPT_MODEL = os.getenv("GEMINI_SCRIPT_MODEL", "gemini-2.5-flash")
+GEMINI_SYNC_MODEL = os.getenv("GEMINI_SYNC_MODEL", "gemini-3.5-flash-lite")
+GEMINI_SCRIPT_MODEL = os.getenv("GEMINI_SCRIPT_MODEL", "gemini-3.5-flash-lite")
 GEMINI_TRANSCRIBE_MODEL = os.getenv("GEMINI_TRANSCRIBE_MODEL", GEMINI_SCRIPT_MODEL)
 WHISPER_LOCAL_MODEL = os.getenv("WHISPER_LOCAL_MODEL", "base")
 
