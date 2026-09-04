@@ -244,13 +244,117 @@ def _seg_get(seg, key, default=None):
         return seg.get(key, default)
     return getattr(seg, key, default)
 
+GEMINI_TRANSCRIBE_MODEL = os.getenv("GEMINI_TRANSCRIBE_MODEL", GEMINI_SCRIPT_MODEL)
+WHISPER_LOCAL_MODEL = os.getenv("WHISPER_LOCAL_MODEL", "base")
+
+def _write_srt(segments: List[Dict]) -> Path:
+    srt_path = TEMP_DIR / "subtitles.srt"
+    with open(srt_path, "w", encoding="utf-8") as srt:
+        for i, seg in enumerate(segments):
+            start = format_srt_time(seg["start"])
+            end = format_srt_time(seg["end"])
+            srt.write(f"{i+1}\n{start} --> {end}\n{seg['text']}\n\n")
+    logger.info(f"✅ Subtitles saved: {srt_path.name}")
+    return srt_path
+
+def _strip_json_fences(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
+        raw = re.sub(r"```\s*$", "", raw)
+    return raw.strip()
+
+_local_whisper_model = None  # lazy-loaded singleton — model load slow hai, ek hi baar karo
+
+def _get_local_whisper_model():
+    """openai-whisper (open-source pip package, `import whisper`) — ye
+    OpenAI ki paid transcription API se bilkul alag hai, koi API key ya
+    rate-limit nahi lagta, poora model local chalta hai. Isi tarah ka
+    approach jo tumhari caption-engine reference file use karti hai."""
+    global _local_whisper_model
+    if _local_whisper_model is None:
+        import whisper as local_whisper_pkg
+        logger.info(f"📦 Local (open-source) Whisper model '{WHISPER_LOCAL_MODEL}' load ho raha hai...")
+        _local_whisper_model = local_whisper_pkg.load_model(WHISPER_LOCAL_MODEL)
+    return _local_whisper_model
+
 @retry_with_backoff()
-def get_whisper_segments(audio_path: Path) -> List[Dict]:
-    logger.info("⏱️ Whisper API se timings nikal rahe hain...")
-    # whisper-1 OpenAI ne deprecate kar diya hai (removal ~Feb 2027) lekin
-    # abhi tak segment-level timestamps ke liye ye hi sabse reliable model
-    # hai (OpenAI docs: "Use whisper-1 when you need word or segment
-    # timestamps"). Jab wo hata diya jaaye, transcription guide check karo.
+def _local_whisper_segments(audio_path: Path) -> List[Dict]:
+    """Primary transcription path — open-source Whisper, poori tarah
+    local (GitHub Actions runner par hi chalta hai, ffmpeg pehle se
+    installed hai workflow mein). Na koi API limit, na koi cost."""
+    logger.info("⏱️ Local Whisper se timings nikal rahe hain...")
+    model = _get_local_whisper_model()
+    result = model.transcribe(str(audio_path), word_timestamps=False)
+    raw_segments = result.get("segments", []) or []
+    segments = [
+        {
+            "start": float(seg.get("start", 0.0)),
+            "end": float(seg.get("end", 0.0)),
+            "text": (seg.get("text", "") or "").strip(),
+        }
+        for seg in raw_segments
+    ]
+    if not segments:
+        raise ValueError("Local Whisper ne khaali segments diye")
+    return segments
+
+@retry_with_backoff()
+def _gemini_transcribe_segments(audio_path: Path) -> List[Dict]:
+    """Extra fallback: Gemini audio understanding (agar local Whisper
+    kisi wajah se fail ho jaaye). Isme bhi Gemini API rate-limit lag
+    sakti hai, isliye ye ab primary nahi, sirf last-resort hai."""
+    logger.info("⏱️ Gemini se audio timings nikal rahe hain...")
+    uploaded = gemini_client.files.upload(file=str(audio_path))
+    try:
+        # Chhote audio ke liye usually turant ACTIVE ho jaata hai, lekin
+        # safety ke liye thoda poll kar lete hain.
+        waited = 0.0
+        while getattr(uploaded.state, "name", uploaded.state) == "PROCESSING" and waited < 30:
+            time.sleep(1.5)
+            waited += 1.5
+            uploaded = gemini_client.files.get(name=uploaded.name)
+        if getattr(uploaded.state, "name", uploaded.state) == "FAILED":
+            raise RuntimeError("Gemini file processing failed")
+
+        prompt = (
+            "Transcribe this audio completely and accurately, preserving the "
+            "original spoken language(s) (e.g. Hindi/Hinglish/English) exactly "
+            "as spoken. Split it into consecutive short segments in chronological "
+            "order that together cover the ENTIRE audio duration (no gaps, no "
+            "overlaps). Respond with ONLY a JSON array, no other text, where each "
+            "item is an object: {\"start\": <seconds as float>, \"end\": <seconds "
+            "as float>, \"text\": <segment text>}."
+        )
+        response = gemini_client.models.generate_content(
+            model=GEMINI_TRANSCRIBE_MODEL,
+            contents=[uploaded, prompt],
+            config=genai_types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        raw = _strip_json_fences(response.text or "")
+        data = json.loads(raw)
+        segments = [
+            {
+                "start": float(item["start"]),
+                "end": float(item["end"]),
+                "text": str(item.get("text", "")).strip(),
+            }
+            for item in data
+        ]
+        if not segments:
+            raise ValueError("Gemini ne khaali segments list wapas ki")
+        return segments
+    finally:
+        try:
+            gemini_client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
+
+@retry_with_backoff()
+def _openai_whisper_segments(audio_path: Path) -> List[Dict]:
+    """Fallback path — sirf tab use hota hai jab Gemini fail ho jaaye
+    (e.g. OpenAI credits/limit khatam ho jaane par bhi bot chalta rahe)."""
+    logger.info("⏱️ (Fallback) OpenAI Whisper se timings nikal rahe hain...")
     with open(audio_path, "rb") as f:
         transcript = openai_client.audio.transcriptions.create(
             model="whisper-1",
@@ -259,7 +363,7 @@ def get_whisper_segments(audio_path: Path) -> List[Dict]:
             timestamp_granularities=["segment"]
         )
     raw_segments = _seg_get(transcript, "segments", []) or []
-    segments = [
+    return [
         {
             "start": float(_seg_get(s, "start", 0.0)),
             "end": float(_seg_get(s, "end", 0.0)),
@@ -268,13 +372,25 @@ def get_whisper_segments(audio_path: Path) -> List[Dict]:
         for s in raw_segments
     ]
 
-    srt_path = TEMP_DIR / "subtitles.srt"
-    with open(srt_path, "w", encoding="utf-8") as srt:
-        for i, seg in enumerate(segments):
-            start = format_srt_time(seg["start"])
-            end = format_srt_time(seg["end"])
-            srt.write(f"{i+1}\n{start} --> {end}\n{seg['text']}\n\n")
-    logger.info(f"✅ Subtitles saved: {srt_path.name}")
+def get_transcript_segments(audio_path: Path) -> List[Dict]:
+    """Audio -> timed segments (subtitles ke liye, aur image-sync ke liye
+    bhi use hote hain). Priority order:
+      1) Local open-source Whisper — na API key, na rate-limit, na cost
+         (jaise caption-engine reference file karti hai).
+      2) OpenAI Whisper API — fallback, agar local model kisi wajah se
+         (missing dependency, corrupt audio, etc.) fail ho jaaye.
+      3) Gemini — last-resort fallback.
+    """
+    try:
+        segments = _local_whisper_segments(audio_path)
+    except Exception as e:
+        logger.warning(f"⚠️ Local Whisper fail ho gaya ({e}), OpenAI Whisper API try kar rahe hain...")
+        try:
+            segments = _openai_whisper_segments(audio_path)
+        except Exception as e2:
+            logger.warning(f"⚠️ OpenAI Whisper bhi fail ho gaya ({e2}), Gemini try kar rahe hain...")
+            segments = _gemini_transcribe_segments(audio_path)
+    _write_srt(segments)
     return segments
 
 def format_srt_time(seconds: float) -> str:
@@ -554,7 +670,7 @@ def run_pipeline(workdir: Path) -> Path:
         else:
             raise FileNotFoundError("Na custom audio mila, na script/story text!")
 
-    segments = get_whisper_segments(audio_file)
+    segments = get_transcript_segments(audio_file)
     total_duration = len(AudioSegment.from_file(audio_file)) / 1000.0
     gapped_segments = fill_segment_gaps(segments, total_duration)
 
