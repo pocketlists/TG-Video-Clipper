@@ -37,5 +37,6 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SARVAM_API_KEY: ${{ secrets.SARVAM_API_KEY }}
           OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
+          FREESOUND_API_KEY: ${{ secrets.FREESOUND_API_KEY }}
         run: |
           python -u one_time_bot.py
