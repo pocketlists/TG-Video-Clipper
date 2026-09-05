@@ -88,6 +88,23 @@ EFFECTS = [
 ZOOM_AMOUNT = 0.16       # 1.0 -> 1.16 tak zoom (subtle-cinematic, jerky nahi)
 PAN_ZOOM_LEVEL = 1.14    # pan effects ke dauraan held zoom (room-to-pan)
 
+# FFmpeg ke zoompan filter ka ek well-known issue hai: crop/zoom position
+# seedhe TARGET resolution (jo aksar 640-1920px chhoti hoti hai) ke pixel
+# grid par compute hoti hai. Ek subtle, slow zoom/pan mein per-frame shift
+# aksar 1 pixel se bhi kam hota hai — zoompan use nearest integer pixel
+# par round karta hai, isliye kai consecutive frames ek hi position par
+# "hold" ho jaate hain, phir achanak 1-2px jump hota hai. Yehi asli
+# "jittery / keyframe thik se na chalna / halka wobble-shake" wala symptom
+# hai — chahe encoded fps (60) bilkul sahi ho, kyunki ye timing ka bug
+# nahi, pixel-rounding ka bug hai.
+# Fix: zoompan se PEHLE image ko ek kaafi bade (supersampled) canvas par
+# scale karo — isse crop-position ki granularity NxN gunaa fine ho jaati
+# hai, rounding-error negligible ban jaata hai, motion buttery-smooth
+# lagti hai. zoompan khud s= se wapas asli target resolution par le aata
+# hai, isliye final output size/encode-cost same rehta hai — sirf ek extra
+# (cheap, ek-baar-wala) upscale step add hota hai.
+ZOOMPAN_SUPERSAMPLE = 4
+
 
 def natural_sort_key(name: str):
     """Filename ke andar jitne bhi number hain unhe REAL integer maan
@@ -218,7 +235,15 @@ class ImageProcessor:
                         f"((ih-ih/zoom)*(1-{et}))")
         else:
             z, x, y = f"(1.0+{ZOOM_AMOUNT}*{et})", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
-        return f"zoompan=z='{z}':x='{x}':y='{y}':{d}:{s}:{fps_str}"
+
+        # Supersample-then-zoompan: zoompan ke andar iw/ih is bade canvas
+        # ke honge, isliye upar ke saare x/y/zoom expressions (jo iw/ih pe
+        # depend karte hain) automatically zyada fine-grained pixel-math
+        # par evaluate honge — koi expression change nahi karni padi.
+        pre_w = self.width * ZOOMPAN_SUPERSAMPLE
+        pre_h = self.height * ZOOMPAN_SUPERSAMPLE
+        prescale = f"scale={pre_w}:{pre_h}:flags=lanczos"
+        return f"{prescale},zoompan=z='{z}':x='{x}':y='{y}':{d}:{s}:{fps_str}"
 
     def standardize_image(self, image_path, output_path):
         """Har image ko — chaahe kitni bhi choti/badi/kisi bhi aspect
@@ -371,8 +396,16 @@ def render_video(
         next_input_idx += 1
 
     if len(audio_labels) > 1:
+        # normalize=0 zaroori hai: amix ka default (normalize=1) poore mix
+        # ko hamesha 1/N se scale karta hai (N = total input tracks),
+        # chahe wo tracks us waqt bol/bajj rahe hon ya nahi — isliye jaise
+        # hi SFX/BGM track count video ke ek hisse se doosre mein badalta
+        # hai, narration ka loudness bhi achanak badal jaata hai (empirically
+        # verified: 1 track = -21dB, 2 tracks = -27dB, 3 tracks = -30dB).
+        # normalize=0 ke saath amix sirf plain additive sum karta hai, gain
+        # already har track ke apne volume= filter se control hoti hai.
         filter_parts.append(
-            "".join(audio_labels) + f"amix=inputs={len(audio_labels)}:duration=first:dropout_transition=2[a_mix]"
+            "".join(audio_labels) + f"amix=inputs={len(audio_labels)}:duration=first:dropout_transition=2:normalize=0[a_mix]"
         )
         audio_map = "[a_mix]"
     else:
