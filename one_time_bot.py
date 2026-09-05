@@ -103,6 +103,15 @@ EFFECTS = [
     "diagonal_zoom_in", "diagonal_zoom_out",
 ]
 
+# Animation smoothness tuning: motion ab clip ki poori duration par
+# ease-in/ease-out (smoothstep) curve se normalize hoti hai, fixed
+# per-frame rate se nahi — isse lambe segments par zoom beech mein
+# "freeze" (max zoom tak pahunch kar ruk jaana) nahi hota, aur chhote
+# segments mein motion negligible nahi lagti. Har clip apni duration mein
+# hi shuru se ant tak smoothly complete hoti hai.
+ZOOM_AMOUNT = 0.16       # 1.0 -> 1.16 tak zoom (subtle-cinematic, jerky nahi)
+PAN_ZOOM_LEVEL = 1.14    # pan effects ke dauraan held zoom (room-to-pan)
+
 DEBOUNCE_SECONDS = 15
 
 if not all([API_ID, API_HASH, BOT_TOKEN]):
@@ -133,6 +142,16 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".oga", ".opus", ".flac", ".aac"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def natural_sort_key(name: str):
+    """Filename ke andar jitne bhi number hain unhe REAL integer maan kar
+    sort karta hai — '2_x.jpg' hamesha '10_x.jpg' se PEHLE aayega (plain
+    alphabetical sorted() mein '10_' '2_' se pehle aa jaata, jo galat
+    order deta tha). 1, 2, 3 ... 9, 10, 11 ... jitni bhi images ho (7 ho
+    ya 700), number ke hisaab se hi strict sequence banegi."""
+    parts = re.split(r"(\d+)", name)
+    return [int(p) if p.isdigit() else p.lower() for p in parts]
 
 # ---------------------------------------------------------------------------
 # Pyrogram Client
@@ -370,25 +389,6 @@ def seg_get(seg, key, default=None):
     return getattr(seg, key, default)
 
 
-def format_srt_time(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int((seconds - int(seconds)) * 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def write_srt(segments: List[Dict]) -> Path:
-    srt_path = TEMP_DIR / "subtitles.srt"
-    with open(srt_path, "w", encoding="utf-8") as srt:
-        for i, seg in enumerate(segments):
-            start = format_srt_time(seg["start"])
-            end = format_srt_time(seg["end"])
-            srt.write(f"{i + 1}\n{start} --> {end}\n{seg['text']}\n\n")
-    logger.info(f"✅ Subtitles saved: {srt_path.name}")
-    return srt_path
-
-
 def strip_json_fences(raw: str) -> str:
     raw = raw.strip()
     if raw.startswith("```"):
@@ -501,8 +501,8 @@ def openai_whisper_segments(audio_path: Path) -> List[Dict]:
 
 
 def get_transcript_segments(audio_path: Path, progress: Optional[ProgressReporter] = None) -> List[Dict]:
-    """Audio -> timed segments (subtitles ke liye, aur image-sync ke liye
-    bhi use hote hain). Priority order:
+    """Audio -> timed segments (image-sync ke liye use hote hain, video mein
+    subtitles burn nahi hote — sirf timing/text ka internal use hai). Priority order:
       1) Local open-source Whisper — na API key, na rate-limit, na cost.
       2) OpenAI Whisper API — fallback.
       3) Gemini — last-resort fallback.
@@ -513,7 +513,6 @@ def get_transcript_segments(audio_path: Path, progress: Optional[ProgressReporte
         if progress:
             progress.update_sync("transcribe", "local Whisper")
         segments = local_whisper_segments(audio_path)
-        write_srt(segments)
         return segments
     except Exception as e:
         errors.append(f"local Whisper: {e}")
@@ -523,7 +522,6 @@ def get_transcript_segments(audio_path: Path, progress: Optional[ProgressReporte
         if progress:
             progress.update_sync("transcribe", "OpenAI Whisper (fallback)")
         segments = openai_whisper_segments(audio_path)
-        write_srt(segments)
         return segments
     except Exception as e:
         errors.append(f"OpenAI Whisper: {e}")
@@ -533,7 +531,6 @@ def get_transcript_segments(audio_path: Path, progress: Optional[ProgressReporte
         if progress:
             progress.update_sync("transcribe", "Gemini (last resort)")
         segments = gemini_transcribe_segments(audio_path)
-        write_srt(segments)
         return segments
     except Exception as e:
         errors.append(f"Gemini: {e}")
@@ -572,17 +569,25 @@ def smart_sync_with_gemini(segments: List[Dict], image_files: List[str], prompts
     You are a master manhwa/manga video editor.
     You are given narration segments (with text) and a list of available
     image filenames, plus optional story/image context.
+    The "Available Images" list below is already given to you in the
+    CORRECT chronological story order (sorted by the number in each
+    filename, e.g. 1_..., 2_..., 3_... up to however many images there
+    are). Treat this order as the ground-truth story sequence.
     Assign EXACTLY one image filename to each segment id, based on what the
     text is describing at that moment.
     Rules:
     1. Use images logically based on the narration text and the image context/prompts.
-    2. Prefer sequential forward flow through the images, but you may reuse one if needed.
+    2. Follow the given image order as the default forward flow — as segment
+       id increases, move forward through the image list in the same order
+       given. Only reuse an earlier image (hold on it a bit longer) or skip
+       ahead if the narration text clearly demands it; never jump backward
+       or reorder the images arbitrarily.
     3. Every segment id from the input must appear exactly once in the output.
     4. Only use filenames from the "Available Images" list — do not invent names.
     5. Output ONLY a JSON array like: [{{"id": 0, "image_filename": "001.jpg"}}, ...]. No other text.
 
     Segments: {json.dumps(segment_data, ensure_ascii=False)}
-    Available Images: {image_files}
+    Available Images (already in correct 1,2,3... story order): {image_files}
     Story / Image Context (may be generic if not provided): {prompts_text}
     """
     try:
@@ -649,36 +654,59 @@ class ImageProcessor:
         d = f"d={total_frames}"
         s = f"s={VIDEO_WIDTH}x{VIDEO_HEIGHT}"
         fps_str = f"fps={fps}"
+
+        # Eased progress (smoothstep: slow-start / slow-end), normalized
+        # to THIS clip's own duration — motion always starts at frame 0
+        # and finishes exactly at the last frame, chahe clip 0.5s ka ho
+        # ya 15s ka.
+        #
+        # Purana code fixed per-frame rate (zoom+0.0015 har frame) use
+        # karta tha jo clip ki duration se independent tha — lambe
+        # segments par zoom apni max/min limit tak pahunch kar beech mein
+        # hi "freeze" ho jaata tha (static image, phir achanak cut —
+        # yahi sabse badi jerkiness ki wajah thi). Aur "zoom_out" /
+        # "zoomout_pan_*" effects mein to zoom start hi apni minimum
+        # limit (1.0) se hota tha, isliye wo poori clip mein bilkul bhi
+        # move hi nahi karte the (silently static) — kabhi static, kabhi
+        # moving clips ke beech achanak cut hona hi "jerky" feel de raha
+        # tha. Ab har effect apni poori duration mein guaranteed, smooth,
+        # ease-in/ease-out motion dega.
+        t = f"(on/{total_frames})"
+        et = f"({t}*{t}*(3-2*{t}))"  # smoothstep(t) -> 0..1, eased
+
+        z_max = 1.0 + ZOOM_AMOUNT
+        pz = PAN_ZOOM_LEVEL
+
         if effect == "zoom_in":
-            z, x, y = "min(zoom+0.0015,1.5)", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
+            z, x, y = f"(1.0+{ZOOM_AMOUNT}*{et})", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
         elif effect == "zoom_out":
-            z, x, y = "max(zoom-0.0015,1.0)", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
+            z, x, y = f"({z_max}-{ZOOM_AMOUNT}*{et})", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
         elif effect == "pan_left":
-            z, x, y = "1.2", f"min( (iw-iw/zoom)*(on/{total_frames}) , iw-iw/zoom )", "(ih-ih/zoom)/2"
+            z, x, y = f"{pz}", f"((iw-iw/zoom)*{et})", "(ih-ih/zoom)/2"
         elif effect == "pan_right":
-            z, x, y = "1.2", f"max( (iw-iw/zoom)*(1 - on/{total_frames}) , 0 )", "(ih-ih/zoom)/2"
+            z, x, y = f"{pz}", f"((iw-iw/zoom)*(1-{et}))", "(ih-ih/zoom)/2"
         elif effect == "pan_up":
-            z, x, y = "1.2", "(iw-iw/zoom)/2", f"max( (ih-ih/zoom)*(1 - on/{total_frames}) , 0 )"
+            z, x, y = f"{pz}", "(iw-iw/zoom)/2", f"((ih-ih/zoom)*(1-{et}))"
         elif effect == "pan_down":
-            z, x, y = "1.2", "(iw-iw/zoom)/2", f"min( (ih-ih/zoom)*(on/{total_frames}) , ih-ih/zoom )"
+            z, x, y = f"{pz}", "(iw-iw/zoom)/2", f"((ih-ih/zoom)*{et})"
         elif effect == "zoomin_pan_left":
-            z, x, y = "min(zoom+0.0015,1.5)", f"(iw-iw/zoom)*(on/{total_frames})", "(ih-ih/zoom)/2"
+            z, x, y = f"(1.0+{ZOOM_AMOUNT}*{et})", f"((iw-iw/zoom)*{et})", "(ih-ih/zoom)/2"
         elif effect == "zoomin_pan_right":
-            z, x, y = "min(zoom+0.0015,1.5)", f"(iw-iw/zoom)*(1 - on/{total_frames})", "(ih-ih/zoom)/2"
+            z, x, y = f"(1.0+{ZOOM_AMOUNT}*{et})", f"((iw-iw/zoom)*(1-{et}))", "(ih-ih/zoom)/2"
         elif effect == "zoomout_pan_left":
-            z, x, y = "max(zoom-0.0015,1.0)", f"(iw-iw/zoom)*(on/{total_frames})", "(ih-ih/zoom)/2"
+            z, x, y = f"({z_max}-{ZOOM_AMOUNT}*{et})", f"((iw-iw/zoom)*{et})", "(ih-ih/zoom)/2"
         elif effect == "zoomout_pan_right":
-            z, x, y = "max(zoom-0.0015,1.0)", f"(iw-iw/zoom)*(1 - on/{total_frames})", "(ih-ih/zoom)/2"
+            z, x, y = f"({z_max}-{ZOOM_AMOUNT}*{et})", f"((iw-iw/zoom)*(1-{et}))", "(ih-ih/zoom)/2"
         elif effect == "diagonal_zoom_in":
-            z, x, y = ("min(zoom+0.0015,1.5)",
-                        f"(iw-iw/zoom)*(on/{total_frames})",
-                        f"(ih-ih/zoom)*(on/{total_frames})")
+            z, x, y = (f"(1.0+{ZOOM_AMOUNT}*{et})",
+                        f"((iw-iw/zoom)*{et})",
+                        f"((ih-ih/zoom)*{et})")
         elif effect == "diagonal_zoom_out":
-            z, x, y = ("max(zoom-0.0015,1.0)",
-                        f"(iw-iw/zoom)*(1 - on/{total_frames})",
-                        f"(ih-ih/zoom)*(1 - on/{total_frames})")
+            z, x, y = (f"({z_max}-{ZOOM_AMOUNT}*{et})",
+                        f"((iw-iw/zoom)*(1-{et}))",
+                        f"((ih-ih/zoom)*(1-{et}))")
         else:
-            z, x, y = "min(zoom+0.0015,1.5)", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
+            z, x, y = f"(1.0+{ZOOM_AMOUNT}*{et})", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
         return f"zoompan=z='{z}':x='{x}':y='{y}':{d}:{s}:{fps_str}"
 
     def standardize_image(self, image_path, output_path):
@@ -690,9 +718,9 @@ class ImageProcessor:
             "ffmpeg", "-y", "-i", str(image_path),
             "-filter_complex",
             "[0:v]split=2[bg][fg];"
-            f"[bg]scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
+            f"[bg]scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase:flags=lanczos,"
             f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT},boxblur=10:5[bgblur];"
-            f"[fg]scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"[fg]scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos,"
             f"pad={VIDEO_WIDTH}:{VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2[fgpad];"
             "[bgblur][fgpad]overlay=(W-w)/2:(H-h)/2:format=auto[out]",
             "-map", "[out]",
@@ -711,6 +739,7 @@ class ImageProcessor:
         cmd = [
             "ffmpeg", "-y",
             "-loop", "1", "-i", str(standardized),
+            "-sws_flags", "lanczos+accurate_rnd",
             "-filter_complex", f"[0:v]{filter_str}[v]",
             "-map", "[v]",
             "-c:v", "libx264", "-preset", VIDEO_PRESET, "-crf", str(VIDEO_CRF),
@@ -730,7 +759,10 @@ def assemble_final_video(sync_data, audio_path, bgm_path: Optional[Path], output
     logger.info("🎬 Final assembly shuru...")
     img_proc = ImageProcessor()
     clip_paths = []
-    fallback_images = sorted(p for p in INPUT_PANELS_DIR.glob("*") if p.suffix.lower() in IMAGE_EXTS)
+    fallback_images = sorted(
+        (p for p in INPUT_PANELS_DIR.glob("*") if p.suffix.lower() in IMAGE_EXTS),
+        key=lambda p: natural_sort_key(p.name),
+    )
     total = len(sync_data)
 
     for idx, item in enumerate(sync_data):
@@ -763,16 +795,12 @@ def assemble_final_video(sync_data, audio_path, bgm_path: Optional[Path], output
         raise PipelineError(f"Clips concat fail: {res.stderr[-500:]}")
 
     if progress:
-        progress.update_sync("assemble", "subtitles + audio mix ho raha hai")
+        progress.update_sync("assemble", "audio mix ho raha hai (no subtitles)")
 
-    srt_path = TEMP_DIR / "subtitles.srt"
-    escaped_srt = str(srt_path).replace('\\', '/').replace(':', '\\:')
+    # NOTE: subtitles intentionally NOT burned into the video anymore —
+    # video par koi subtitle/caption text overlay nahi aayega, sirf clean visuals.
     final_cmd = ["ffmpeg", "-y", "-i", str(temp_video), "-i", str(audio_path)]
-    filter_complex = (
-        f"[0:v]fps={VIDEO_FPS},subtitles='{escaped_srt}':"
-        "force_style='FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1'[v_sub]"
-    )
+    filter_complex = f"[0:v]fps={VIDEO_FPS}[v_out]"
     if bgm_path and bgm_path.exists():
         final_cmd.extend(["-stream_loop", "-1", "-i", str(bgm_path)])
         filter_complex += ";[2:a]volume=0.08[bgm];[1:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[a_mix]"
@@ -781,7 +809,7 @@ def assemble_final_video(sync_data, audio_path, bgm_path: Optional[Path], output
         audio_map = "1:a"
     final_cmd.extend([
         "-filter_complex", filter_complex,
-        "-map", "[v_sub]",
+        "-map", "[v_out]",
         "-map", audio_map,
         "-c:v", "libx264", "-preset", VIDEO_PRESET, "-crf", str(VIDEO_CRF),
         "-r", str(VIDEO_FPS),
@@ -814,7 +842,10 @@ def run_pipeline(work_dir: Path, progress: Optional[ProgressReporter] = None) ->
 
     if progress:
         progress.update_sync("images", "scan ho raha hai")
-    images = sorted(f.name for f in INPUT_PANELS_DIR.glob("*") if f.suffix.lower() in IMAGE_EXTS)
+    images = sorted(
+        (f.name for f in INPUT_PANELS_DIR.glob("*") if f.suffix.lower() in IMAGE_EXTS),
+        key=natural_sort_key,
+    )
     if not images:
         raise PipelineError("Koi bhi image nahi mili! ZIP ya image files bhejo.")
     logger.info(f"🖼️ Total images: {len(images)}")
@@ -909,7 +940,7 @@ def extract_images_from_zip(zip_path: Path, dest_dir: Path) -> int:
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     count = 0
-    for f in sorted(extract_tmp.rglob("*")):
+    for f in sorted(extract_tmp.rglob("*"), key=lambda p: natural_sort_key(p.name)):
         if not f.is_file() or f.name.startswith(".") or "__MACOSX" in f.parts:
             continue
         if f.suffix.lower() not in IMAGE_EXTS:
