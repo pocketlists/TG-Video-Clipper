@@ -43,7 +43,7 @@ import shutil
 import time
 import zipfile
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from functools import wraps
 
 import requests
@@ -676,6 +676,34 @@ def load_timeline(work_dir: Path, images: List[str], total_duration: float) -> L
     return scenes
 
 
+def timeline_is_sane(scenes: List[Dict], total_duration: float) -> Tuple[bool, str]:
+    """timeline.json (kisi bahar ke tool/Gemini se banayi hui) mein wahi
+    purana data-quality bug ho sakta hai jo pehle diagnose hua tha — chahe
+    file parse ho jaaye aur images bhi sab match karein, phir bhi kuch
+    individual scenes 30-60s tak lambi ban jaati hain jabki baaki normal
+    (~few seconds) hoti hain — Gemini ka coarse/uneven scene-splitting.
+    Blindly trust karne se pehle ek sanity check: agar koi bhi scene
+    expected-uniform-average se bahut zyada lambi hai (aur absolute roop
+    se bhi lambi hai), to poori file ko is run ke liye suspect maan kar
+    reject karte hain, taaki auto_generate_timeline() (jo hamesha
+    evenly-distributed, pause-snapped boundaries deta hai) fallback ban
+    sake."""
+    n = len(scenes)
+    if n == 0 or total_duration <= 0:
+        return True, ""
+    expected_avg = total_duration / n
+    max_dur = max(s["end"] - s["start"] for s in scenes)
+    cap = max(12.0, 2.5 * expected_avg)
+    if max_dur > cap:
+        return False, (
+            f"sabse lambi scene {max_dur:.1f}s ki hai jabki {n} images ke "
+            f"hisaab se expected average sirf ~{expected_avg:.1f}s hai "
+            f"(sanity cap {cap:.1f}s) — ye wahi purana 'ek image 30-60s tak "
+            f"screen par ruki rehti hai' pattern hai"
+        )
+    return True, ""
+
+
 def auto_generate_timeline(images: List[str], words: List[Dict], total_duration: float) -> List[Dict]:
     """timeline.json na ho to bot khud image-sequence + timing banata hai —
     Gemini ka is decision mein koi role nahi (na sequence mein, na timing
@@ -826,16 +854,27 @@ def run_pipeline(work_dir: Path, quality: str = DEFAULT_QUALITY,
     total_duration = len(AudioSegment.from_file(audio_file)) / 1000.0
     gapped_segments = fill_segment_gaps(segments, total_duration)
 
-    # Image-sequence: agar user ne timeline.json di hai to wahi ground-
-    # truth maani jaati hai (backward compatible). Warna bot khud
+    # Image-sequence: agar user ne timeline.json di hai to pehle usi ko
+    # try karte hain (backward compatible) — LEKIN blindly trust nahi
+    # karte, kyunki wahi purana bug (kuch scenes 30-60s tak lambi, Gemini
+    # ke coarse scene-splitting se) us file ke andar bhi ho sakta hai.
+    # Sanity check fail hote hi (ya file na ho to seedhe) bot khud
     # auto_generate_timeline() se sequence + timing banata hai — filename
     # number se sort + Whisper word-level pauses se natural snapping.
-    # Dono cases mein Gemini ka is decision mein koi role nahi.
+    # Dono paths mein Gemini ka is decision mein koi role nahi.
     if progress:
         progress.update_sync("timeline", "image sequence taiyar ho rahi hai")
+    scenes = None
     if (WORK_DIR / "timeline.json").exists():
         scenes = load_timeline(WORK_DIR, images, total_duration)
-    else:
+        ok, reason = timeline_is_sane(scenes, total_duration)
+        if not ok:
+            logger.warning(
+                f"⚠️ timeline.json reject ki gayi ({reason}) — is run ke "
+                "liye ignore karke bot khud auto-generate karega."
+            )
+            scenes = None
+    if scenes is None:
         scenes = auto_generate_timeline(images, _LAST_WHISPER_WORDS, total_duration)
     # Safety net: agar timeline mein kahin consecutive entries same image
     # ki hon (source AI/tool ne pre-merge nahi kiya), tab bhi animation
