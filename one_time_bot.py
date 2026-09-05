@@ -436,6 +436,7 @@ def _gemini_generate_with_rotation(contents, config=None, max_retries_per_model:
 
 
 _local_whisper_model = None  # lazy-loaded singleton — model load slow hai, ek hi baar karo
+_LAST_WHISPER_WORDS: List[Dict] = []  # local_whisper_segments() ke word-level output ka cache — auto_generate_timeline() isse padhta hai
 
 
 def get_local_whisper_model():
@@ -454,10 +455,13 @@ def get_local_whisper_model():
 def local_whisper_segments(audio_path: Path) -> List[Dict]:
     """Primary transcription path — open-source Whisper, poori tarah
     local (GitHub Actions runner par hi chalta hai, ffmpeg pehle se
-    installed hai workflow mein). Na koi API limit, na koi cost."""
-    logger.info("⏱️ Local Whisper se timings nikal rahe hain...")
+    installed hai workflow mein). Na koi API limit, na koi cost.
+    word_timestamps=True rakha hai taaki auto_generate_timeline() ko
+    fine-grained word-level pauses milein (image-boundary snapping ke
+    liye) — sentence-level se bhi zyada precise natural cut-points."""
+    logger.info("⏱️ Local Whisper se timings nikal rahe hain (word-level)...")
     model = get_local_whisper_model()
-    result = model.transcribe(str(audio_path), word_timestamps=False)
+    result = model.transcribe(str(audio_path), word_timestamps=True)
     raw_segments = result.get("segments", []) or []
     segments = [
         {
@@ -469,6 +473,22 @@ def local_whisper_segments(audio_path: Path) -> List[Dict]:
     ]
     if not segments:
         raise ValueError("Local Whisper ne khaali segments diye")
+    # Word-level timestamps ek global cache mein rakhte hain (segments
+    # list se return nahi karte taaki har existing caller — jo sirf
+    # start/end/text expect karta hai — bina change kiye chalta rahe).
+    words = []
+    for seg in raw_segments:
+        for w in (seg.get("words") or []):
+            try:
+                words.append({
+                    "start": float(w.get("start", 0.0)),
+                    "end": float(w.get("end", 0.0)),
+                    "text": (w.get("word", "") or "").strip(),
+                })
+            except (TypeError, ValueError):
+                continue
+    global _LAST_WHISPER_WORDS
+    _LAST_WHISPER_WORDS = words
     return segments
 
 
@@ -545,6 +565,11 @@ def get_transcript_segments(audio_path: Path, progress: Optional[ProgressReporte
       3) Gemini — last-resort fallback.
     Teeno fail ho jaayein to PipelineError raise hoti hai (upar tak
     readable message pahunchta hai, silent crash nahi hota)."""
+    # Naye run se pehle purana word-cache saaf karo — warna local Whisper
+    # is baar fail ho jaaye (OpenAI/Gemini fallback chale) to auto-timeline
+    # galti se pichle audio file ke stale words use kar legi.
+    global _LAST_WHISPER_WORDS
+    _LAST_WHISPER_WORDS = []
     errors = []
     try:
         if progress:
@@ -651,6 +676,95 @@ def load_timeline(work_dir: Path, images: List[str], total_duration: float) -> L
     return scenes
 
 
+def auto_generate_timeline(images: List[str], words: List[Dict], total_duration: float) -> List[Dict]:
+    """timeline.json na ho to bot khud image-sequence + timing banata hai —
+    Gemini ka is decision mein koi role nahi (na sequence mein, na timing
+    mein), isliye 25-ke-baad-28 jaisi galtiyan yahan possible hi nahi hain.
+
+    Logic:
+      1) Images ka sequence sirf filename ke number se aata hai (caller
+         se already natural_sort_key se sorted aata hai) — koi AI guess
+         nahi.
+      2) Total audio duration ko N images mein rough equal-split karte
+         hain — N-1 internal boundaries.
+      3) Har boundary ko sabse nikatam Whisper word-gap (pause) ke center
+         par "snap" karte hain, taaki cut kisi word ke beech mein na aaye.
+         Agar us boundary ke aas-paas koi pause hi nahi hai (continuous
+         bolna chal raha hai), rough-split boundary hi as-is rehta hai.
+      4) Ek boundary snap hone ka asar agli image ke start par bhi padta
+         hai (chain), isliye final list left-to-right mein consistent
+         (non-decreasing, gap-free) bana kar return karte hain.
+    """
+    n = len(images)
+    if n == 0:
+        raise PipelineError("Auto-timeline ke liye koi image nahi mili.")
+
+    # Consecutive words ke beech ke gaps — yahi hamare "pause" candidates
+    # hain. Har gap ka center hi snap-target hota hai.
+    gap_centers: List[float] = []
+    sorted_words = sorted(words, key=lambda w: w["start"]) if words else []
+    for i in range(len(sorted_words) - 1):
+        gap_start = sorted_words[i]["end"]
+        gap_end = sorted_words[i + 1]["start"]
+        if gap_end > gap_start:
+            gap_centers.append((gap_start + gap_end) / 2.0)
+    gap_centers.sort()
+
+    def nearest_gap_center(target: float) -> Optional[float]:
+        """Binary-search se target ke sabse nikatam gap-center dhoondo.
+        Koi gap hi na ho to None (caller rough-split boundary rakhega)."""
+        if not gap_centers:
+            return None
+        import bisect
+        idx = bisect.bisect_left(gap_centers, target)
+        candidates = []
+        if idx < len(gap_centers):
+            candidates.append(gap_centers[idx])
+        if idx > 0:
+            candidates.append(gap_centers[idx - 1])
+        return min(candidates, key=lambda c: abs(c - target))
+
+    # Rough equal-split boundaries (N-1 internal cut points).
+    rough_boundaries = [total_duration * i / n for i in range(1, n)]
+
+    # Har boundary ko nearest pause-center par snap karo.
+    snapped: List[float] = []
+    for rb in rough_boundaries:
+        snapped_point = nearest_gap_center(rb)
+        snapped.append(snapped_point if snapped_point is not None else rb)
+
+    # Consistency guarantee — snapping ke baad bhi boundaries strictly
+    # badhte kram mein rahein (do boundaries ek hi gap par snap ho sakti
+    # hain agar images bahut chhoti hon ya pauses sparse hon), warna
+    # scenes overlap/negative-duration ho jaayenge.
+    for i in range(1, len(snapped)):
+        if snapped[i] <= snapped[i - 1]:
+            snapped[i] = snapped[i - 1] + 0.05
+
+    boundaries = [0.0] + snapped + [total_duration]
+    # Aakhri clamp — agar upar wale +0.05 nudge se total_duration cross ho
+    # gaya ho (bahut zyada images, bahut kam audio — edge case), to end
+    # ko hi wapas total_duration par le aao taaki video duration na badhe.
+    if boundaries[-2] >= boundaries[-1]:
+        boundaries[-1] = boundaries[-2] + 0.05
+
+    scenes = []
+    for i, img in enumerate(images):
+        scenes.append({
+            "start": boundaries[i],
+            "end": boundaries[i + 1],
+            "image_filename": img,
+            "text": "",
+        })
+
+    logger.info(
+        f"📋 Auto-timeline generate hui: {n} images, "
+        f"{len(gap_centers)} natural pauses mile, "
+        f"{sum(1 for rb, s in zip(rough_boundaries, snapped) if s != rb)} boundaries snap hui."
+    )
+    return scenes
+
+
 # ---------------------------------------------------------------------------
 # NOTE: SFX detection/search/download ab sfx_engine.py mein hai
 # (build_sfx_events — import upar). Image standardize, zoom/pan effects
@@ -712,13 +826,17 @@ def run_pipeline(work_dir: Path, quality: str = DEFAULT_QUALITY,
     total_duration = len(AudioSegment.from_file(audio_file)) / 1000.0
     gapped_segments = fill_segment_gaps(segments, total_duration)
 
-    # Image-sequence ab timeline.json se aati hai (REQUIRED) — Gemini se
-    # guess nahi karwaya jaata, kyunki wo kabhi-kabhi sequence galat
-    # laga deta tha. Transcript (upar) phir bhi nikala jaata hai kyunki
-    # SFX-detection ko real narration text + timing chahiye.
+    # Image-sequence: agar user ne timeline.json di hai to wahi ground-
+    # truth maani jaati hai (backward compatible). Warna bot khud
+    # auto_generate_timeline() se sequence + timing banata hai — filename
+    # number se sort + Whisper word-level pauses se natural snapping.
+    # Dono cases mein Gemini ka is decision mein koi role nahi.
     if progress:
-        progress.update_sync("timeline", "timeline.json load ho rahi hai")
-    scenes = load_timeline(WORK_DIR, images, total_duration)
+        progress.update_sync("timeline", "image sequence taiyar ho rahi hai")
+    if (WORK_DIR / "timeline.json").exists():
+        scenes = load_timeline(WORK_DIR, images, total_duration)
+    else:
+        scenes = auto_generate_timeline(images, _LAST_WHISPER_WORDS, total_duration)
     # Safety net: agar timeline mein kahin consecutive entries same image
     # ki hon (source AI/tool ne pre-merge nahi kiya), tab bhi animation
     # restart wala bug na aaye — idempotent hai, already-merged timeline
@@ -916,7 +1034,6 @@ def is_session_ready(sess: dict) -> bool:
     return (
         sess["images_count"] > 0
         and (sess["has_audio"] or sess["has_script"])
-        and sess["has_timeline"]
     )
 
 
@@ -928,7 +1045,8 @@ def build_status_text(sess: dict) -> str:
         + ("" if sess["has_audio"] else " (ya niche wala script bhejo)"),
         f"{'✅' if sess['has_script'] else '➖'} Script/story text"
         + (" (optional, audio ke bina zaroori)" if not sess["has_audio"] else " (optional)"),
-        f"{'✅' if sess['has_timeline'] else '⏳'} timeline.json (REQUIRED — image sequence isi se aati hai)",
+        f"{'✅' if sess['has_timeline'] else '➖'} timeline.json (optional — na ho to bot khud "
+        f"filename-order + audio-pause se sequence banayega)",
         f"{'✅' if sess['prompts_chars'] > 0 else '➖'} Image prompts (optional, ab sirf SFX-context ke liye)",
         f"{'✅' if sess['has_bgm'] else '➖'} Background music (optional)",
         f"{'✅ ' + sess['quality'] if sess.get('quality') else '⏳'} Video quality"
@@ -1045,14 +1163,15 @@ async def start_handler(client, message):
         "(Ise OWNER_CHAT_ID GitHub secret mein daal do taaki agli baar "
         "workflow start hote hi aapko yahin ping mil jaaye.)\n\n"
         "Ab bas files bhejo — kisi bhi order mein, jitni marzi ek saath:\n"
-        "🖼️ ZIP (sirf images, folder ho ya na ho, farq nahi padta) — ya loose images\n"
+        "🖼️ ZIP (sirf images, folder ho ya na ho, farq nahi padta) — ya loose images "
+        "(filename mein number ho, jaise 1_xyz.jpg, 2_xyz.jpg — sequence isi se banegi)\n"
         "🎧 Audio (aapka khud ka voiceover)\n"
-        "📋 timeline.json — REQUIRED! [{image, start, end}, ...] format mein "
-        "image-sequence (kisi aur AI/tool se banai ho to bhi chalegi)\n"
+        "📋 (Optional) timeline.json — [{image, start, end}, ...] format mein "
+        "custom image-sequence. Na do to bot khud filename-number se sequence "
+        "banayega aur audio ke natural pauses par timing snap karega — AI se "
+        "sequence kabhi guess nahi karwaya jaata.\n"
         "📝 (Optional) extra story-context wali .txt file\n"
         "🎵 (Optional) doosra audio file = background music\n\n"
-        "timeline.json ke bina render shuru nahi hoga — image sequence ab "
-        "isi file se aati hai, AI se guess nahi karwaya jaata.\n\n"
         "Sab files mil jaane ke baad bot khud tumhe QUALITY CHUNNE ke liye "
         "buttons dega (360p/480p/720p/1080p — koi message type nahi karna "
         "padega, bas button dabao). Button dabate hi render turant shuru "
