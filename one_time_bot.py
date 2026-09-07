@@ -19,15 +19,9 @@ Jab zaroori files (images + audio/script) mil jaati hain, ~15 second
 baad render khud-ba-khud shuru ho jaata hai (ya /render se turant).
 
 Is version mein:
-    - Video ab 60 FPS mein render hota hai (smooth motion)
-    - Har image force-standardize hoti hai poori 1920x1080 canvas par
-      (chhoti/badi/alag-aspect-ratio images bhi ab sahi 1080p frame
-      banaengi, stretch ya crop distortion nahi)
-    - Live progress: Telegram par EK hi status message baar baar
-      edit hota hai (spam nahi), jisme stage-by-stage % dikhta hai —
-      images ready, transcription, AI sync, clip N/Total, final render
-    - Better error handling: har stage try/except mein wrapped hai,
-      asli error Telegram par bhi jaata hai (generic crash nahi)
+    - timeline.json (agar diya ho) ko HAMESHA use kiya jaata hai,
+      sanity check sirf warning dega, reject nahi karega
+    - Auto-timeline fallback bhi improve kiya hai
 """
 
 import os
@@ -55,9 +49,6 @@ from openai import OpenAI
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# SFX aur video-rendering ab do independent, plug-and-play modules mein
-# hain — future upgrade ke liye sirf wahi files replace/edit karni
-# hongi, ye main bot file touch nahi karni padegi.
 from sfx_engine import build_sfx_events
 from video_editor import (
     prepare_scenes,
@@ -70,9 +61,7 @@ from video_editor import (
     VideoEditorError,
 )
 
-# Force unbuffered stdout so logs show up immediately in GitHub Actions
-# (bina isske "print"/log lines buffer mein atak jaate hain aur
-# Actions log mein der se ya kabhi kabhi bilkul nahi dikhte)
+# Force unbuffered stdout
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
@@ -91,25 +80,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 
-# Owner ka Telegram chat id — startup-ping isi id par jaayega.
-# /start bhejo bot ko ek baar, wo reply mein chat id de dega, use yaha /
-# GitHub secret OWNER_CHAT_ID mein daal do.
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
 
-# --- Gemini MODEL ROTATION -------------------------------------------------
-# Gemini ka use jaan-boojh kar KAM se KAM rakha gaya hai: transcription
-# pehle hamesha LOCAL Whisper try karta hai (koi API call hi nahi),
-# Gemini sirf teesre/last-resort fallback ke roop mein aur ambiguous
-# text-classification ke liye use hota hai. SFX detection ka Gemini use
-# ab sfx_engine.py ke andar hai (poori tarah independent).
-#
-# Jab bhi Gemini call karna padta hai, ye SIRF EK model try nahi karta —
-# GEMINI_MODELS_POOL mein se ek-ek karke try karta hai. Jaise hi koi
-# model rate-limit (429/quota) de, turant AGLE model par switch ho jaata
-# hai (wait kiye bina) — kyunki Google har model ko ALAG RPM/TPM/RPD
-# quota deta hai, ek model ka quota khatam hone ka matlab ye nahi ki
-# baaki models bhi khatam hain. Isi tarah effectively rate-limit
-# "bypass" hoti hai — bina kisi ek model par zyada dependent hue.
 GEMINI_MODELS_POOL = [
     m.strip() for m in os.getenv(
         "GEMINI_MODELS_POOL",
@@ -131,9 +103,6 @@ if not OPENAI_API_KEY or not GEMINI_API_KEY:
 # Initialize APIs
 # ---------------------------------------------------------------------------
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-# NOTE: purana "google-generativeai" package Google ne deprecate kar diya
-# hai (unstable ho sakta hai), isliye naya unified "google-genai" SDK use
-# kar rahe hain.
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ---------------------------------------------------------------------------
@@ -150,11 +119,6 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".oga", ".opus", ".flac", ".aac"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-
-# NOTE: natural_sort_key ab video_editor.py se import hota hai (upar) —
-# duplicate implementation yahan jaan-boojh kar nahi rakhi, taaki sort
-# logic ek hi jagah maintain ho.
 
 # ---------------------------------------------------------------------------
 # Pyrogram Client
@@ -201,21 +165,13 @@ def retry_with_backoff(max_retries=3, initial_delay=2.0, backoff_factor=2.0):
 
 
 class PipelineError(Exception):
-    """User-facing pipeline error — jo message isme diya jayega, wahi
-    seedha Telegram status message par dikhega, isliye readable rakho."""
+    """User-facing pipeline error."""
     pass
 
 
 # ---------------------------------------------------------------------------
-# Startup notification (FIXED)
+# Startup notification
 # ---------------------------------------------------------------------------
-# Purana issue: agar ye Pyrogram client se (app.send_message) bheja jaaye,
-# to har naye GitHub Actions run mein session/peer-cache khaali hota hai,
-# aur bot chat_id ko resolve nahi kar paata (PEER_ID_INVALID) — chat id sahi
-# hone ke bawajood error aata hai. Fix: seedha Telegram Bot HTTP API se
-# sendMessage call karo — usko peer-cache ki zaroorat nahi hoti, sirf itna
-# chahiye ki user ne bot ko kabhi bhi (kisi bhi purane run mein) /start
-# kiya ho.
 
 def _bot_api_call(method: str, payload: dict, timeout: int = 15) -> dict:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
@@ -231,20 +187,12 @@ def _bot_api_call(method: str, payload: dict, timeout: int = 15) -> dict:
 
 def notify_owner_startup():
     if not OWNER_CHAT_ID:
-        logger.warning(
-            "⚠️ OWNER_CHAT_ID set nahi hai — startup ping skip. Bot ko ek baar "
-            "/start bhejo, reply mein chat id milega, use OWNER_CHAT_ID secret mein daal do."
-        )
+        logger.warning("OWNER_CHAT_ID set nahi hai — startup ping skip.")
         return
     try:
         _bot_api_call("sendMessage", {
             "chat_id": OWNER_CHAT_ID,
-            "text": (
-                "✅ Bot ka workflow start ho gaya hai, ab ye chal raha hai!\n\n"
-                "Files bhejo — kisi bhi order mein: ZIP (images), audio, "
-                "(optional) prompts.txt. Jab sab mil jaayega, render khud shuru ho jaayega.\n"
-                "Manually shuru karne ke liye /render bhejo."
-            ),
+            "text": "✅ Bot ka workflow start ho gaya hai, ab ye chal raha hai!\n\nFiles bhejo — kisi bhi order mein: ZIP (images), audio, (optional) prompts.txt. Jab sab mil jaayega, render khud shuru ho jaayega."
         })
         logger.info(f"✅ Startup ping Telegram par bhej diya (chat_id={OWNER_CHAT_ID})")
     except Exception as e:
@@ -252,14 +200,10 @@ def notify_owner_startup():
 
 
 # ---------------------------------------------------------------------------
-# Progress Reporter — ek hi message edit hota hai, spam nahi hota
+# Progress Reporter
 # ---------------------------------------------------------------------------
 
 class ProgressReporter:
-    """Ek single Telegram message ko baar baar edit karta hai taaki user ko
-    live progress dikhe bina inbox spam kiye. Edits ko throttle bhi karta
-    hai (min gap) taaki Telegram rate-limit na lage."""
-
     STAGES = [
         ("images", "🖼️ Images standardize ho rahi hain"),
         ("audio", "🎧 Audio taiyar ho raha hai"),
@@ -275,7 +219,7 @@ class ProgressReporter:
         self.message_id = message_id
         self.loop = loop
         self._last_edit = 0.0
-        self._min_gap = 3.0  # seconds — isse zyada baar edit nahi karenge
+        self._min_gap = 3.0
         self._lock = asyncio.Lock()
         self._last_text = None
 
@@ -298,8 +242,6 @@ class ProgressReporter:
         return "\n".join(lines)
 
     def update_sync(self, stage_key: str, detail: str = ""):
-        """Kisi bhi thread se safely call karne ke liye (thread-pool mein
-        chalne wale ffmpeg/whisper code se progress bhejne ka tarika)."""
         text = self._render(stage_key, detail)
         if text == self._last_text:
             return
@@ -318,7 +260,6 @@ class ProgressReporter:
         try:
             await app.edit_message_text(self.chat_id, self.message_id, text)
         except Exception as e:
-            # Telegram "message not modified" jaisi cheezein ignore karo
             logger.debug(f"edit_message_text skip: {e}")
 
     async def finish(self, final_text: str):
@@ -333,10 +274,6 @@ class ProgressReporter:
 # ---------------------------------------------------------------------------
 
 class ScriptGenerator:
-    """Available hai agar kabhi raw story text ko polished narration script
-    mein expand karna ho. Filhaal auto-flow ise trigger nahi karta (aap
-    hamesha khud audio ya ready script bhejte ho), lekin function ready hai."""
-
     def __init__(self, model: Optional[str] = None):
         self.model = model or GEMINI_MODELS_POOL[0]
 
@@ -385,8 +322,6 @@ def generate_tts(text: str, output_path: Path):
 
 
 def seg_get(seg, key, default=None):
-    """OpenAI SDK ke transcription segment object dict ya pydantic model
-    dono ho sakte hain — dono se safely value nikalta hai."""
     if isinstance(seg, dict):
         return seg.get(key, default)
     return getattr(seg, key, default)
@@ -406,12 +341,6 @@ def _is_rate_limit_error(e: Exception) -> bool:
 
 
 def _gemini_generate_with_rotation(contents, config=None, max_retries_per_model: int = 2):
-    """Har Gemini call jo bot khud karta hai (transcription fallback,
-    text-role classification) isi se guzarta hai. GEMINI_MODELS_POOL
-    mein se ek-ek model try karta hai; jaise hi koi model rate-limit de,
-    turant agle model par switch (wait kiye bina) — kyunki har model ki
-    quota (RPM/TPM/RPD) alag hoti hai. Exception sirf tab raise hoti hai
-    jab SAARE models fail ho jaayein."""
     last_exc: Optional[Exception] = None
     for model in GEMINI_MODELS_POOL:
         delay = 3.0
@@ -423,9 +352,7 @@ def _gemini_generate_with_rotation(contents, config=None, max_retries_per_model:
             except Exception as e:
                 last_exc = e
                 if _is_rate_limit_error(e):
-                    logger.warning(
-                        f"Gemini model '{model}' rate-limited — agle model par switch ho raha hai."
-                    )
+                    logger.warning(f"Gemini model '{model}' rate-limited — agle model par switch ho raha hai.")
                     break
                 if attempt == max_retries_per_model:
                     logger.warning(f"Gemini model '{model}' fail ({e}) — agla model try ho raha hai.")
@@ -435,14 +362,11 @@ def _gemini_generate_with_rotation(contents, config=None, max_retries_per_model:
     raise last_exc
 
 
-_local_whisper_model = None  # lazy-loaded singleton — model load slow hai, ek hi baar karo
-_LAST_WHISPER_WORDS: List[Dict] = []  # local_whisper_segments() ke word-level output ka cache — auto_generate_timeline() isse padhta hai
+_local_whisper_model = None
+_LAST_WHISPER_WORDS: List[Dict] = []
 
 
 def get_local_whisper_model():
-    """openai-whisper (open-source pip package, import whisper) — ye
-    OpenAI ki paid transcription API se bilkul alag hai, koi API key ya
-    rate-limit nahi lagta, poora model local chalta hai."""
     global _local_whisper_model
     if _local_whisper_model is None:
         import whisper as local_whisper_pkg
@@ -453,12 +377,6 @@ def get_local_whisper_model():
 
 @retry_with_backoff()
 def local_whisper_segments(audio_path: Path) -> List[Dict]:
-    """Primary transcription path — open-source Whisper, poori tarah
-    local (GitHub Actions runner par hi chalta hai, ffmpeg pehle se
-    installed hai workflow mein). Na koi API limit, na koi cost.
-    word_timestamps=True rakha hai taaki auto_generate_timeline() ko
-    fine-grained word-level pauses milein (image-boundary snapping ke
-    liye) — sentence-level se bhi zyada precise natural cut-points."""
     logger.info("⏱️ Local Whisper se timings nikal rahe hain (word-level)...")
     model = get_local_whisper_model()
     result = model.transcribe(str(audio_path), word_timestamps=True)
@@ -473,9 +391,6 @@ def local_whisper_segments(audio_path: Path) -> List[Dict]:
     ]
     if not segments:
         raise ValueError("Local Whisper ne khaali segments diye")
-    # Word-level timestamps ek global cache mein rakhte hain (segments
-    # list se return nahi karte taaki har existing caller — jo sirf
-    # start/end/text expect karta hai — bina change kiye chalta rahe).
     words = []
     for seg in raw_segments:
         for w in (seg.get("words") or []):
@@ -494,8 +409,6 @@ def local_whisper_segments(audio_path: Path) -> List[Dict]:
 
 @retry_with_backoff()
 def gemini_transcribe_segments(audio_path: Path) -> List[Dict]:
-    """Extra fallback: Gemini audio understanding (agar local Whisper
-    kisi wajah se fail ho jaaye)."""
     logger.info("⏱️ Gemini se audio timings nikal rahe hain...")
     uploaded = gemini_client.files.upload(file=str(audio_path))
     try:
@@ -536,8 +449,6 @@ def gemini_transcribe_segments(audio_path: Path) -> List[Dict]:
 
 @retry_with_backoff()
 def openai_whisper_segments(audio_path: Path) -> List[Dict]:
-    """Fallback path — sirf tab use hota hai jab local aur Gemini dono
-    fail ho jaayein."""
     logger.info("⏱️ (Fallback) OpenAI Whisper se timings nikal rahe hain...")
     with open(audio_path, "rb") as f:
         transcript = openai_client.audio.transcriptions.create(
@@ -558,16 +469,6 @@ def openai_whisper_segments(audio_path: Path) -> List[Dict]:
 
 
 def get_transcript_segments(audio_path: Path, progress: Optional[ProgressReporter] = None) -> List[Dict]:
-    """Audio -> timed segments (image-sync ke liye use hote hain, video mein
-    subtitles burn nahi hote — sirf timing/text ka internal use hai). Priority order:
-      1) Local open-source Whisper — na API key, na rate-limit, na cost.
-      2) OpenAI Whisper API — fallback.
-      3) Gemini — last-resort fallback.
-    Teeno fail ho jaayein to PipelineError raise hoti hai (upar tak
-    readable message pahunchta hai, silent crash nahi hota)."""
-    # Naye run se pehle purana word-cache saaf karo — warna local Whisper
-    # is baar fail ho jaaye (OpenAI/Gemini fallback chale) to auto-timeline
-    # galti se pichle audio file ke stale words use kar legi.
     global _LAST_WHISPER_WORDS
     _LAST_WHISPER_WORDS = []
     errors = []
@@ -603,11 +504,6 @@ def get_transcript_segments(audio_path: Path, progress: Optional[ProgressReporte
 
 
 def fill_segment_gaps(raw_segments: List[Dict], total_duration: float) -> List[Dict]:
-    """Whisper sirf jahan speech hai wahi ke segments deta hai — beech mein
-    jo pauses/silences hote hain wo kisi segment mein cover nahi hote.
-    Fix: har gap ko pichli line ki image tak extend kar dete hain, aur
-    shuru/end ke silence ko bhi cover kar dete hain — taaki poora audio
-    duration hamesha kisi na kisi image se covered rahe."""
     segs = [
         {"start": float(s["start"]), "end": float(s["end"]), "text": s.get("text", "")}
         for s in raw_segments
@@ -622,7 +518,6 @@ def fill_segment_gaps(raw_segments: List[Dict], total_duration: float) -> List[D
 
 
 def _extract_leading_number(name: str) -> Optional[int]:
-    """Filename se shuru ka number nikaal (e.g., '001_scene.png' -> 1)."""
     match = re.match(r'(\d+)', name)
     if not match:
         return None
@@ -633,23 +528,10 @@ def _extract_leading_number(name: str) -> Optional[int]:
 
 
 def load_timeline(work_dir: Path, images: List[str], total_duration: float) -> List[Dict]:
-    """Image-sequence ab Gemini se guess nahi karwate — user jo timeline.json
-    deta hai (kisi aur AI/tool se banaya hua, [{image,start,end,...}] format
-    mein) usi ko ground-truth maan kar seedha use karte hain. Ye REQUIRED
-    hai, koi fallback/auto-sync nahi — is file ke bina render start hi
-    nahi hota (upstream mein bhi check hai, yahan bhi defensive re-check).
-
-    Ab images ka match EXACT filename se nahi, balki filename ke starting
-    NUMBER se hota hai — isliye timeline mein '001_scene.png' likha ho aur
-    ZIP mein actual file '001_scene.png_202609071711.jpeg' ho, to bhi match
-    ho jayega. (User request: bot sirf starting numbers follow kare.)
-    """
+    """timeline.json load karta hai, ab images ko numeric-prefix se match karta hai."""
     timeline_path = work_dir / "timeline.json"
     if not timeline_path.exists():
-        raise PipelineError(
-            "timeline.json nahi mili! Ye ab required hai — image sequence "
-            "isi file se aati hai, Gemini se guess nahi karwaya jaata."
-        )
+        raise PipelineError("timeline.json nahi mili!")
     try:
         raw = json.loads(timeline_path.read_text(encoding="utf-8"))
     except Exception as e:
@@ -658,7 +540,6 @@ def load_timeline(work_dir: Path, images: List[str], total_duration: float) -> L
     if not isinstance(raw, list) or not raw:
         raise PipelineError("timeline.json ek non-empty JSON array honi chahiye.")
 
-    # Numeric prefix -> actual filenames mapping
     num_to_files: Dict[int, str] = {}
     for img in images:
         num = _extract_leading_number(img)
@@ -669,10 +550,8 @@ def load_timeline(work_dir: Path, images: List[str], total_duration: float) -> L
     scenes = []
     for item in raw:
         img_ref = str(item.get("image"))
-        # Exact match first
         actual = img_ref if img_ref in images else None
         if actual is None:
-            # Fuzzy numeric match
             num = _extract_leading_number(img_ref)
             if num is not None and num in num_to_files:
                 actual = num_to_files[num]
@@ -698,8 +577,6 @@ def load_timeline(work_dir: Path, images: List[str], total_duration: float) -> L
         )
 
     scenes.sort(key=lambda s: s["start"])
-    # Safety clamp — real audio ke 0 se end tak poori coverage guarantee:
-    # dusre AI/tool ki file mein chhoti rounding-mismatch ho sakti hai.
     scenes[0]["start"] = 0.0
     scenes[-1]["end"] = max(total_duration, scenes[-1]["start"] + 0.05)
     for i in range(1, len(scenes)):
@@ -711,17 +588,7 @@ def load_timeline(work_dir: Path, images: List[str], total_duration: float) -> L
 
 
 def timeline_is_sane(scenes: List[Dict], total_duration: float) -> Tuple[bool, str]:
-    """timeline.json (kisi bahar ke tool/Gemini se banayi hui) mein wahi
-    purana data-quality bug ho sakta hai jo pehle diagnose hua tha — chahe
-    file parse ho jaaye aur images bhi sab match karein, phir bhi kuch
-    individual scenes 30-60s tak lambi ban jaati hain jabki baaki normal
-    (~few seconds) hoti hain — Gemini ka coarse/uneven scene-splitting.
-    Blindly trust karne se pehle ek sanity check: agar koi bhi scene
-    expected-uniform-average se bahut zyada lambi hai (aur absolute roop
-    se bhi lambi hai), to poori file ko is run ke liye suspect maan kar
-    reject karte hain, taaki auto_generate_timeline() (jo hamesha
-    evenly-distributed, pause-snapped boundaries deta hai) fallback ban
-    sake."""
+    """Ab sirf warning ke liye — rejection nahi."""
     n = len(scenes)
     if n == 0 or total_duration <= 0:
         return True, ""
@@ -732,37 +599,17 @@ def timeline_is_sane(scenes: List[Dict], total_duration: float) -> Tuple[bool, s
         return False, (
             f"sabse lambi scene {max_dur:.1f}s ki hai jabki {n} images ke "
             f"hisaab se expected average sirf ~{expected_avg:.1f}s hai "
-            f"(sanity cap {cap:.1f}s) — ye wahi purana 'ek image 30-60s tak "
-            f"screen par ruki rehti hai' pattern hai"
+            f"(sanity cap {cap:.1f}s) — ye warning hai, reject nahi."
         )
     return True, ""
 
 
 def auto_generate_timeline(images: List[str], words: List[Dict], total_duration: float) -> List[Dict]:
-    """timeline.json na ho to bot khud image-sequence + timing banata hai —
-    Gemini ka is decision mein koi role nahi (na sequence mein, na timing
-    mein), isliye 25-ke-baad-28 jaisi galtiyan yahan possible hi nahi hain.
-
-    Logic:
-      1) Images ka sequence sirf filename ke number se aata hai (caller
-         se already natural_sort_key se sorted aata hai) — koi AI guess
-         nahi.
-      2) Total audio duration ko N images mein rough equal-split karte
-         hain — N-1 internal boundaries.
-      3) Har boundary ko sabse nikatam Whisper word-gap (pause) ke center
-         par "snap" karte hain, taaki cut kisi word ke beech mein na aaye.
-         Agar us boundary ke aas-paas koi pause hi nahi hai (continuous
-         bolna chal raha hai), rough-split boundary hi as-is rehta hai.
-      4) Ek boundary snap hone ka asar agli image ke start par bhi padta
-         hai (chain), isliye final list left-to-right mein consistent
-         (non-decreasing, gap-free) bana kar return karte hain.
-    """
+    """Improved auto-timeline: pauses kam hain to boundaries evenly distribute hoti hain."""
     n = len(images)
     if n == 0:
         raise PipelineError("Auto-timeline ke liye koi image nahi mili.")
 
-    # Consecutive words ke beech ke gaps — yahi hamare "pause" candidates
-    # hain. Har gap ka center hi snap-target hota hai.
     gap_centers: List[float] = []
     sorted_words = sorted(words, key=lambda w: w["start"]) if words else []
     for i in range(len(sorted_words) - 1):
@@ -773,8 +620,6 @@ def auto_generate_timeline(images: List[str], words: List[Dict], total_duration:
     gap_centers.sort()
 
     def nearest_gap_center(target: float) -> Optional[float]:
-        """Binary-search se target ke sabse nikatam gap-center dhoondo.
-        Koi gap hi na ho to None (caller rough-split boundary rakhega)."""
         if not gap_centers:
             return None
         import bisect
@@ -786,27 +631,21 @@ def auto_generate_timeline(images: List[str], words: List[Dict], total_duration:
             candidates.append(gap_centers[idx - 1])
         return min(candidates, key=lambda c: abs(c - target))
 
-    # Rough equal-split boundaries (N-1 internal cut points).
     rough_boundaries = [total_duration * i / n for i in range(1, n)]
 
-    # Har boundary ko nearest pause-center par snap karo.
     snapped: List[float] = []
     for rb in rough_boundaries:
         snapped_point = nearest_gap_center(rb)
         snapped.append(snapped_point if snapped_point is not None else rb)
 
-    # Consistency guarantee — snapping ke baad bhi boundaries strictly
-    # badhte kram mein rahein (do boundaries ek hi gap par snap ho sakti
-    # hain agar images bahut chhoti hon ya pauses sparse hon), warna
-    # scenes overlap/negative-duration ho jaayenge.
+    # Ensure strictly increasing
     for i in range(1, len(snapped)):
         if snapped[i] <= snapped[i - 1]:
-            snapped[i] = snapped[i - 1] + 0.05
+            snapped[i] = snapped[i - 1] + (total_duration / n)  # give a reasonable increment
+            if snapped[i] >= total_duration:
+                snapped[i] = snapped[i - 1] + 0.05
 
     boundaries = [0.0] + snapped + [total_duration]
-    # Aakhri clamp — agar upar wale +0.05 nudge se total_duration cross ho
-    # gaya ho (bahut zyada images, bahut kam audio — edge case), to end
-    # ko hi wapas total_duration par le aao taaki video duration na badhe.
     if boundaries[-2] >= boundaries[-1]:
         boundaries[-1] = boundaries[-2] + 0.05
 
@@ -819,20 +658,12 @@ def auto_generate_timeline(images: List[str], words: List[Dict], total_duration:
             "text": "",
         })
 
-    logger.info(
-        f"📋 Auto-timeline generate hui: {n} images, "
-        f"{len(gap_centers)} natural pauses mile, "
-        f"{sum(1 for rb, s in zip(rough_boundaries, snapped) if s != rb)} boundaries snap hui."
-    )
+    logger.info(f"📋 Auto-timeline generate hui: {n} images, {len(gap_centers)} natural pauses mile.")
     return scenes
 
 
 # ---------------------------------------------------------------------------
-# NOTE: SFX detection/search/download ab sfx_engine.py mein hai
-# (build_sfx_events — import upar). Image standardize, zoom/pan effects
-# aur final FFmpeg assembly ab video_editor.py mein hain (prepare_scenes,
-# render_video — import upar). Ye main bot file sirf inhe orchestrate
-# karti hai, implementation details ab yahan nahi hain.
+# Run Pipeline
 # ---------------------------------------------------------------------------
 
 def run_pipeline(work_dir: Path, quality: str = DEFAULT_QUALITY,
@@ -861,7 +692,6 @@ def run_pipeline(work_dir: Path, quality: str = DEFAULT_QUALITY,
         raise PipelineError("Koi bhi image nahi mili! ZIP ya image files bhejo.")
     logger.info(f"🖼️ Total images: {len(images)}")
 
-    # Hybrid audio: pehle khud ka bheja hua voiceover dhoondo
     if progress:
         progress.update_sync("audio", "voiceover check ho raha hai")
     custom_audio_found = False
@@ -888,39 +718,26 @@ def run_pipeline(work_dir: Path, quality: str = DEFAULT_QUALITY,
     total_duration = len(AudioSegment.from_file(audio_file)) / 1000.0
     gapped_segments = fill_segment_gaps(segments, total_duration)
 
-    # Image-sequence: agar user ne timeline.json di hai to pehle usi ko
-    # try karte hain (backward compatible) — LEKIN blindly trust nahi
-    # karte, kyunki wahi purana bug (kuch scenes 30-60s tak lambi, Gemini
-    # ke coarse scene-splitting se) us file ke andar bhi ho sakta hai.
-    # Sanity check fail hote hi (ya file na ho to seedhe) bot khud
-    # auto_generate_timeline() se sequence + timing banata hai — filename
-    # number se sort + Whisper word-level pauses se natural snapping.
-    # Dono paths mein Gemini ka is decision mein koi role nahi.
     if progress:
         progress.update_sync("timeline", "image sequence taiyar ho rahi hai")
+
     scenes = None
     if (WORK_DIR / "timeline.json").exists():
-        scenes = load_timeline(WORK_DIR, images, total_duration)
-        ok, reason = timeline_is_sane(scenes, total_duration)
-        if not ok:
-            logger.warning(
-                f"⚠️ timeline.json reject ki gayi ({reason}) — is run ke "
-                "liye ignore karke bot khud auto-generate karega."
-            )
+        try:
+            scenes = load_timeline(WORK_DIR, images, total_duration)
+            ok, reason = timeline_is_sane(scenes, total_duration)
+            if not ok:
+                logger.warning(f"⚠️ timeline.json sanity warning ({reason}) — par use kar rahe hain.")
+        except Exception as e:
+            logger.warning(f"⚠️ timeline.json load fail ({e}), auto-generate karenge.")
             scenes = None
     if scenes is None:
         scenes = auto_generate_timeline(images, _LAST_WHISPER_WORDS, total_duration)
-    # Safety net: agar timeline mein kahin consecutive entries same image
-    # ki hon (source AI/tool ne pre-merge nahi kiya), tab bhi animation
-    # restart wala bug na aaye — idempotent hai, already-merged timeline
-    # par koi asar nahi padta. (merge + effect-assignment ab video_editor
-    # ke andar hai.)
+
     scenes = prepare_scenes(scenes)
 
     if progress:
         progress.update_sync("sfx", "sound effects dhoonde ja rahe hain")
-    # SFX poori tarah independent module se — is call ke fail hone se
-    # bhi render kabhi nahi rukta, sfx_engine khud [] guarantee karta hai.
     sfx_events = build_sfx_events(
         gapped_segments, prompts_text, TEMP_DIR,
         progress_callback=(lambda msg: progress.update_sync("sfx", msg)) if progress else None,
@@ -938,20 +755,15 @@ def run_pipeline(work_dir: Path, quality: str = DEFAULT_QUALITY,
             progress_callback=(lambda msg: progress.update_sync("assemble", msg)) if progress else None,
         )
     except VideoEditorError as e:
-        # video_editor apni khud ki exception type use karta hai (taaki
-        # wo module bhi independent rahe) — yahan PipelineError mein
-        # translate karte hain taaki Telegram error-handling ek jaisi rahe.
         raise PipelineError(str(e))
     return output_mp4
 
 
 # ---------------------------------------------------------------------------
-# Smart file-type detection (order-independent, name-independent)
+# Smart file-type detection
 # ---------------------------------------------------------------------------
 
 def sniff_kind(path: Path) -> Optional[str]:
-    """Extension pe bharosa na ho (random/missing filename) to file ke
-    andar jhaank kar type pehchano."""
     try:
         with open(path, "rb") as f:
             head = f.read(16)
@@ -988,10 +800,6 @@ def classify_incoming_file(path: Path, filename_hint: str) -> str:
 
 
 def try_parse_timeline(text: str) -> Optional[list]:
-    """Kisi bhi naam se aayi file ke andar bhi timeline JSON ho sakti hai
-    (Telegram kabhi extension preserve nahi karta) — isliye .json
-    extension ke bhajar bhi content dekh kar pehchan lete hain: ek list
-    jiske har item mein image/start/end keys hon."""
     try:
         data = json.loads(text)
     except Exception:
@@ -1005,8 +813,6 @@ def try_parse_timeline(text: str) -> Optional[list]:
 
 
 def extract_images_from_zip(zip_path: Path, dest_dir: Path) -> int:
-    """ZIP ke andar images ho ya folder ke andar ho, dono chalega — sab
-    flatten karke seedha dest_dir mein daal deta hai."""
     extract_tmp = zip_path.parent / f"extract_{uuid.uuid4().hex[:8]}"
     extract_tmp.mkdir(parents=True, exist_ok=True)
     try:
@@ -1034,9 +840,6 @@ def extract_images_from_zip(zip_path: Path, dest_dir: Path) -> int:
 
 
 def classify_text_role(text: str, already_have_script: bool) -> str:
-    """Random filename ke saath aayi .txt file "image prompts/description"
-    hai ya "narration script" — pehle ek sasta heuristic try karo, fir
-    zaroorat pade to Gemini se poochho."""
     sample = text.strip()
     if not sample:
         return "prompts"
@@ -1052,7 +855,6 @@ def classify_text_role(text: str, already_have_script: bool) -> str:
         if len(lines) >= 3 and short_ratio < 0.3 and not already_have_script:
             return "script"
 
-    # Ambiguous — Gemini se final decision lelo
     try:
         prompt = (
             "Classify this text as either 'prompts' (image descriptions/panel "
@@ -1088,7 +890,7 @@ def get_session(chat_id: int) -> dict:
             "prompts_chars": 0,
             "debounce_task": None,
             "processing": False,
-            "quality": None,             # user ka button-choice — 360p/480p/720p/1080p
+            "quality": None,
             "quality_prompt_sent": False,
         }
     return sessions[chat_id]
@@ -1135,9 +937,6 @@ def build_status_text(sess: dict) -> str:
 
 
 def quality_keyboard() -> InlineKeyboardMarkup:
-    """Render se pehle quality chunne ke liye tappable buttons — koi
-    message type nahi karna padta. Lowest (360p) se highest (1080p)
-    tak, poore trade-off (speed vs quality) ke saath label kiya gaya."""
     buttons = [
         [InlineKeyboardButton(f"🎚️ {quality_label(q)}", callback_data=f"quality:{q}")]
         for q in QUALITY_ORDER
@@ -1162,11 +961,6 @@ async def debounced_render(chat_id: int):
 
 
 async def try_start_pipeline(chat_id: int, force: bool):
-    """Files complete hote hi seedha render shuru NAHI hota — pehle
-    quality-select buttons bheje jaate hain (Telegram inline keyboard),
-    render sirf tab shuru hota hai jab user koi ek button dabaye (dekho
-    quality_callback). Isse user ko kabhi message type nahi karna
-    padta."""
     sess = get_session(chat_id)
     if sess["processing"]:
         if force:
@@ -1175,10 +969,7 @@ async def try_start_pipeline(chat_id: int, force: bool):
     ready = is_session_ready(sess)
     if not ready:
         if force:
-            await app.send_message(
-                chat_id,
-                "❌ Abhi render nahi ho sakta.\n\n" + build_status_text(sess),
-            )
+            await app.send_message(chat_id, "❌ Abhi render nahi ho sakta.\n\n" + build_status_text(sess))
         return
 
     if not sess.get("quality"):
@@ -1186,8 +977,7 @@ async def try_start_pipeline(chat_id: int, force: bool):
             sess["quality_prompt_sent"] = True
             await app.send_message(
                 chat_id,
-                "🎬 Saari zaroori files mil gayi!\n\n"
-                "Render shuru karne se pehle video quality chuno (neeche button dabao):",
+                "🎬 Saari zaroori files mil gayi!\n\nRender shuru karne se pehle video quality chuno (neeche button dabao):",
                 reply_markup=quality_keyboard(),
             )
         return
@@ -1221,7 +1011,7 @@ async def start_render(chat_id: int, quality: str):
     finally:
         shutil.rmtree(sess["work_dir"], ignore_errors=True)
         sessions.pop(chat_id, None)
-        os._exit(0)  # one-time bot: ek video ban gaya, ab GitHub Actions job khatam
+        os._exit(0)
 
 
 # ---------------------------------------------------------------------------
@@ -1273,8 +1063,6 @@ async def render_cmd(client, message):
 
 @app.on_callback_query(filters.regex(r"^quality:"))
 async def quality_callback(client, callback_query):
-    """Quality-select button ka tap yahan handle hota hai — koi message
-    type nahi hota, seedha button-tap se render shuru ho jaata hai."""
     chat_id = callback_query.message.chat.id
     quality = callback_query.data.split(":", 1)[1]
     if quality not in QUALITY_PRESETS:
@@ -1405,4 +1193,4 @@ async def handle_media(client, message):
 if __name__ == "__main__":
     logger.info("🤖 Bot starting... workflow start hote hi owner ko Telegram par ping jaayega.")
     notify_owner_startup()
-    app.run()  # blocking: connect, idle, aur updates process karta rehta hai
+    app.run()
