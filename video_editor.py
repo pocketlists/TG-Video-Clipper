@@ -113,6 +113,47 @@ def natural_sort_key(name: str):
     return [int(p) if p.isdigit() else p.lower() for p in parts]
 
 
+def _extract_numeric_prefix(filename: str):
+    """Filename ke shuru ke digits nikaal kar integer return karta hai.
+    Jaise '001_scene.png' -> 1, '12_abc.jpg' -> 12. Agar no digits to None."""
+    m = re.match(r'^(\d+)', filename)
+    return int(m.group(1)) if m else None
+
+
+def resolve_image_path(input_panels_dir: Path, image_filename: str):
+    """
+    Given a directory and an image filename (jo timeline mein aaya ho),
+    pehle exact filename match karta hai, phir numeric prefix se match
+    karta hai. Agar dono fail, to VideoEditorError raise karta hai.
+
+    Returns: resolved Path object
+    """
+    # Exact match pehle
+    exact_path = input_panels_dir / image_filename
+    if exact_path.exists():
+        return exact_path
+
+    # Numeric prefix match
+    prefix = _extract_numeric_prefix(image_filename)
+    if prefix is not None:
+        # Saare files jo is prefix se shuru hote hain (common image extensions)
+        candidates = []
+        for f in input_panels_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in ('.png', '.jpg', '.jpeg', '.webp'):
+                f_prefix = _extract_numeric_prefix(f.name)
+                if f_prefix == prefix:
+                    candidates.append(f)
+        if candidates:
+            # Natural sort karke pehla wala lo (consistent order)
+            candidates.sort(key=lambda p: natural_sort_key(p.name))
+            return candidates[0]
+
+    # Kuch nahi mila
+    raise VideoEditorError(
+        f"Image '{image_filename}' nahi mili (numeric prefix '{prefix}' se bhi match nahi hui)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Scene preparation — merge consecutive same-image segments + assign
 # a non-repeating effect per merged scene.
@@ -385,12 +426,10 @@ def render_video(
         if not img_file:
             raise VideoEditorError(f"Scene {idx + 1} mein image_filename missing hai.")
 
-        img_path = input_panels_dir / img_file
-        if not img_path.exists():
-            raise VideoEditorError(
-                f"Timeline image missing: '{img_file}'. "
-                "timeline.json aur uploaded images ke filenames check karein."
-            )
+        # --- FIX: image path resolve karo numeric prefix fallback ke saath ---
+        img_path = resolve_image_path(input_panels_dir, img_file)
+        # Actual filename update kar do taaki baad mein logging sahi ho
+        item["image_filename"] = img_path.name
 
         try:
             start = float(item["start"])
