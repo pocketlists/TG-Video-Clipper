@@ -189,8 +189,9 @@ class ImageProcessor:
             candidates.remove(previous_effect)
         return random.choice(candidates)
 
-    def generate_zoompan_filter(self, effect, duration, fps):
-        total_frames = max(int(duration * fps), 1)
+    def generate_zoompan_filter(self, effect, duration, fps, total_frames=None):
+        """Build a deterministic zoompan filter for an exact frame count."""
+        total_frames = max(int(total_frames if total_frames is not None else round(duration * fps)), 1)
         d = f"d={total_frames}"
         s = f"s={self.width}x{self.height}"
         fps_str = f"fps={fps}"
@@ -267,27 +268,66 @@ class ImageProcessor:
         if result.returncode != 0:
             raise VideoEditorError(f"Image standardize fail ({image_path.name}): {result.stderr[-500:]}")
 
-    def create_clip(self, image_path, output_path, duration, effect):
-        logger.info(f"  → Effect: {effect} on {image_path.name}")
+    def create_clip(self, image_path, output_path, duration, effect, total_frames=None):
+        """Render one image scene with deterministic frame-based duration.
+
+        The caller may provide total_frames derived from the absolute
+        timeline boundaries. That prevents cumulative rounding drift across
+        many short scenes.
+        """
+        image_path = Path(image_path)
+        output_path = Path(output_path)
+
+        if not image_path.exists():
+            raise VideoEditorError(
+                f"Timeline image missing: '{image_path.name}'. "
+                "timeline.json aur uploaded images ke filenames check karein."
+            )
+
+        if duration <= 0:
+            raise VideoEditorError(
+                f"Invalid scene duration for image '{image_path.name}': {duration:.6f}s"
+            )
+
+        total_frames = max(
+            int(total_frames) if total_frames is not None else round(duration * self.fps),
+            1,
+        )
+        logger.info(
+            f"  → Effect: {effect} on {image_path.name} "
+            f"({duration:.3f}s / {total_frames} frames)"
+        )
+
         standardized = self.temp_dir / f"std_{image_path.stem}.png"
         self.standardize_image(image_path, standardized)
-        filter_str = self.generate_zoompan_filter(effect, duration, self.fps)
+
+        filter_str = self.generate_zoompan_filter(
+            effect, duration, self.fps, total_frames=total_frames
+        )
+
         cmd = [
             "ffmpeg", "-y",
             "-loop", "1", "-i", str(standardized),
-            "-sws_flags", "lanczos+accurate_rnd",
             "-filter_complex", f"[0:v]{filter_str}[v]",
             "-map", "[v]",
-            "-c:v", "libx264", "-preset", self.ffmpeg_preset, "-crf", str(self.crf),
-            "-t", str(duration),
-            "-r", str(self.fps),
+            "-frames:v", str(total_frames),
+            "-c:v", "libx264",
+            "-preset", self.ffmpeg_preset,
+            "-crf", str(self.crf),
             "-pix_fmt", "yuv420p",
+            "-an",
             str(output_path),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        standardized.unlink(missing_ok=True)
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+        finally:
+            standardized.unlink(missing_ok=True)
+
         if result.returncode != 0:
-            raise VideoEditorError(f"Clip render fail ({image_path.name}): {result.stderr[-500:]}")
+            raise VideoEditorError(
+                f"Clip render fail ({image_path.name}): {result.stderr[-800:]}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -328,26 +368,64 @@ def render_video(
 
     logger.info(f"🎬 Final assembly shuru... (quality={quality})")
     img_proc = ImageProcessor(quality, temp_dir)
-    image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
     clip_paths = []
-    fallback_images = sorted(
-        (p for p in input_panels_dir.glob("*") if p.suffix.lower() in image_exts),
-        key=lambda p: natural_sort_key(p.name),
-    )
     total = len(scenes)
 
+    if not scenes:
+        raise VideoEditorError("Render ke liye koi scene nahi mila.")
+
+    # Timeline seconds ko absolute frame boundaries mein quantize karte hain.
+    # Isse har scene independently round hone ke bajaye poori timeline ek hi
+    # frame grid follow karti hai aur cumulative duration drift avoid hota hai.
     for idx, item in enumerate(scenes):
         if progress_callback:
             progress_callback(f"clip {idx + 1}/{total}")
-        img_file = item["image_filename"]
+
+        img_file = str(item.get("image_filename", ""))
+        if not img_file:
+            raise VideoEditorError(f"Scene {idx + 1} mein image_filename missing hai.")
+
         img_path = input_panels_dir / img_file
-        if not img_path.exists() and fallback_images:
-            img_path = fallback_images[idx % len(fallback_images)]
-            logger.warning(f"Image {img_file} missing, using {img_path.name}")
-        dur = float(item["end"]) - float(item["start"])
-        dur = max(dur, 0.5)
+        if not img_path.exists():
+            raise VideoEditorError(
+                f"Timeline image missing: '{img_file}'. "
+                "timeline.json aur uploaded images ke filenames check karein."
+            )
+
+        try:
+            start = float(item["start"])
+            end = float(item["end"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VideoEditorError(
+                f"Scene {idx + 1} mein invalid start/end timing hai: {exc}"
+            )
+
+        if start < 0 or end <= start:
+            raise VideoEditorError(
+                f"Scene {idx + 1} ki timing invalid hai: {start:.6f} → {end:.6f}s"
+            )
+
+        start_frame = round(start * img_proc.fps)
+        end_frame = round(end * img_proc.fps)
+        total_frames = end_frame - start_frame
+
+        if total_frames < 1:
+            raise VideoEditorError(
+                f"Scene {idx + 1} ({img_file}) ek frame se chhoti hai: "
+                f"{end - start:.6f}s"
+            )
+
+        # Frame-grid duration actual encoded clip duration ka source of truth
+        # hai; float seconds sirf logging/filter progress ke liye use hote hain.
+        duration = total_frames / img_proc.fps
         clip_out = temp_dir / f"clip_{idx:03d}.mp4"
-        img_proc.create_clip(img_path, clip_out, dur, item["effect"])
+        img_proc.create_clip(
+            img_path,
+            clip_out,
+            duration,
+            item.get("effect", "zoom_in"),
+            total_frames=total_frames,
+        )
         clip_paths.append(clip_out)
 
     if progress_callback:
@@ -359,7 +437,16 @@ def render_video(
             f.write(f"file '{c.resolve()}'\n")
     temp_video = temp_dir / "no_subs.mp4"
     res = subprocess.run(
-        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_txt), "-c", "copy", str(temp_video)],
+        [
+            "ffmpeg", "-y",
+            "-fflags", "+genpts",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(concat_txt),
+            "-an",
+            "-c:v", "copy",
+            str(temp_video),
+        ],
         capture_output=True, text=True,
     )
     if res.returncode != 0:
@@ -373,7 +460,7 @@ def render_video(
     # narration (hamesha) + optional BGM + optional sparse SFX clips
     # (har ek apne exact timestamp par adelay se place hota hai).
     final_cmd = ["ffmpeg", "-y", "-i", str(temp_video), "-i", str(audio_path)]
-    filter_parts = [f"[0:v]fps={preset['fps']}[v_out]"]
+    filter_parts = ["[0:v]setpts=PTS-STARTPTS[v_out]"]
     audio_labels = ["[1:a]"]
     next_input_idx = 2
 
@@ -416,7 +503,6 @@ def render_video(
         "-map", "[v_out]",
         "-map", audio_map,
         "-c:v", "libx264", "-preset", preset["preset"], "-crf", str(preset["crf"]),
-        "-r", str(preset["fps"]),
         "-c:a", "aac", "-b:a", "192k",
         "-shortest",
         str(output_path),
