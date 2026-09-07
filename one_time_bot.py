@@ -621,12 +621,29 @@ def fill_segment_gaps(raw_segments: List[Dict], total_duration: float) -> List[D
     return segs
 
 
+def _extract_leading_number(name: str) -> Optional[int]:
+    """Filename se shuru ka number nikaal (e.g., '001_scene.png' -> 1)."""
+    match = re.match(r'(\d+)', name)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
 def load_timeline(work_dir: Path, images: List[str], total_duration: float) -> List[Dict]:
     """Image-sequence ab Gemini se guess nahi karwate — user jo timeline.json
     deta hai (kisi aur AI/tool se banaya hua, [{image,start,end,...}] format
     mein) usi ko ground-truth maan kar seedha use karte hain. Ye REQUIRED
     hai, koi fallback/auto-sync nahi — is file ke bina render start hi
-    nahi hota (upstream mein bhi check hai, yahan bhi defensive re-check)."""
+    nahi hota (upstream mein bhi check hai, yahan bhi defensive re-check).
+
+    Ab images ka match EXACT filename se nahi, balki filename ke starting
+    NUMBER se hota hai — isliye timeline mein '001_scene.png' likha ho aur
+    ZIP mein actual file '001_scene.png_202609071711.jpeg' ho, to bhi match
+    ho jayega. (User request: bot sirf starting numbers follow kare.)
+    """
     timeline_path = work_dir / "timeline.json"
     if not timeline_path.exists():
         raise PipelineError(
@@ -641,16 +658,27 @@ def load_timeline(work_dir: Path, images: List[str], total_duration: float) -> L
     if not isinstance(raw, list) or not raw:
         raise PipelineError("timeline.json ek non-empty JSON array honi chahiye.")
 
-    valid_images = set(images)
-    missing = sorted({str(item.get("image")) for item in raw if str(item.get("image")) not in valid_images})
-    if missing:
-        raise PipelineError(
-            "timeline.json mein ye images ZIP mein maujood nahi hain: " + ", ".join(missing[:15]) +
-            (" ... aur bhi" if len(missing) > 15 else "")
-        )
+    # Numeric prefix -> actual filenames mapping
+    num_to_files: Dict[int, str] = {}
+    for img in images:
+        num = _extract_leading_number(img)
+        if num is not None and num not in num_to_files:
+            num_to_files[num] = img
 
+    missing = []
     scenes = []
     for item in raw:
+        img_ref = str(item.get("image"))
+        # Exact match first
+        actual = img_ref if img_ref in images else None
+        if actual is None:
+            # Fuzzy numeric match
+            num = _extract_leading_number(img_ref)
+            if num is not None and num in num_to_files:
+                actual = num_to_files[num]
+        if actual is None:
+            missing.append(img_ref)
+            continue
         try:
             start = float(item["start"])
             end = float(item["end"])
@@ -659,9 +687,15 @@ def load_timeline(work_dir: Path, images: List[str], total_duration: float) -> L
         scenes.append({
             "start": start,
             "end": max(end, start + 0.05),
-            "image_filename": str(item["image"]),
+            "image_filename": actual,
             "text": str(item.get("reason", "")),
         })
+
+    if missing:
+        raise PipelineError(
+            "timeline.json mein ye images numeric-prefix se bhi nahi mili: " + ", ".join(missing[:10]) +
+            (" ... aur bhi" if len(missing) > 10 else "")
+        )
 
     scenes.sort(key=lambda s: s["start"])
     # Safety clamp — real audio ke 0 se end tak poori coverage guarantee:
@@ -672,7 +706,7 @@ def load_timeline(work_dir: Path, images: List[str], total_duration: float) -> L
         if scenes[i]["start"] < scenes[i - 1]["end"]:
             scenes[i]["start"] = scenes[i - 1]["end"]
 
-    logger.info(f"📋 timeline.json se {len(scenes)} scenes load hui (Gemini image-sync bypass).")
+    logger.info(f"📋 timeline.json se {len(scenes)} scenes load hui (numeric-prefix matching).")
     return scenes
 
 
