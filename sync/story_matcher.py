@@ -3,15 +3,20 @@ from __future__ import annotations
 import logging
 import re
 from difflib import SequenceMatcher
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
 
 class MatchWarning(str):
-    """String-compatible warning object jo attribute access (.message, .code) bhi support karta hai."""
+    """String-compatible warning object jo .message aur .code attributes bhi support karta hai."""
 
-    def __new__(cls, message: str, code: str = "match_warning", index: Optional[int] = None) -> "MatchWarning":
+    def __new__(
+        cls,
+        message: str,
+        code: str = "match_warning",
+        index: Optional[int] = None,
+    ) -> "MatchWarning":
         obj = super().__new__(cls, message)
         obj.message = str(message)
         obj.text = str(message)
@@ -20,13 +25,84 @@ class MatchWarning(str):
         return obj
 
 
+class _ImageObjectProxy:
+    """
+    Guarantee karta hai ki `matched.image.file` hamesha ek valid non-empty string ho,
+    aur baaki saare attributes original plan entry object se milte rahein.
+    """
+
+    def __init__(
+        self,
+        raw_entry: Any,
+        file_name: str,
+        story_text: str = "",
+        index: int = 0,
+    ) -> None:
+        self._raw_entry = raw_entry
+        self.file: str = str(file_name or f"{index + 1}.webp")
+        self.filename: str = self.file
+        self.image_filename: str = self.file
+        self.path: str = self.file
+        self.name: str = self.file
+        self.story: str = str(
+            getattr(raw_entry, "story", None)
+            or getattr(raw_entry, "text", None)
+            or story_text
+            or ""
+        )
+        self.text: str = self.story
+        self.index: int = int(getattr(raw_entry, "index", index) or index)
+
+    def __getattr__(self, name: str) -> Any:
+        raw = self.__dict__.get("_raw_entry")
+        if raw is not None:
+            if isinstance(raw, dict) and name in raw:
+                return raw[name]
+            if hasattr(raw, name):
+                return getattr(raw, name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    def __str__(self) -> str:
+        return self.file
+
+    def __repr__(self) -> str:
+        return f"ImageEntry(file={self.file!r}, index={self.index})"
+
+
+def _ensure_image_object(plan_item: Any, media_path: Optional[str], prompt: str, idx: int) -> Any:
+    """
+    Plan entry se wo object return karta hai jiske paas `.file` attribute mojood ho.
+    Agar plan_item ke paas pehle se `.file` string hai, toh direct plan_item use hota hai.
+    """
+    fallback_file = str(media_path or f"{idx + 1}.webp")
+
+    if plan_item is None:
+        return _ImageObjectProxy(None, fallback_file, prompt, idx)
+
+    # Case 1: plan_item.image ek object hai jiske paas .file attribute hai
+    nested_img = getattr(plan_item, "image", None)
+    if nested_img is not None and not isinstance(nested_img, str):
+        nested_file = getattr(nested_img, "file", None)
+        if isinstance(nested_file, str) and nested_file.strip():
+            return nested_img
+
+    # Case 2: plan_item khud ek ImageEntry object hai jiske paas .file attribute hai
+    direct_file = getattr(plan_item, "file", None)
+    if isinstance(direct_file, str) and direct_file.strip():
+        return plan_item
+
+    # Case 3: Fallback proxy jo .file attribute guarantee karta hai
+    return _ImageObjectProxy(plan_item, fallback_file, prompt, idx)
+
+
 class MatchedItem:
-    """Ek single plan entry aur uske matched sentence/time-range ka data hold karta hai."""
+    """Ek single plan image entry aur uske matched sentence/time-range ka data hold karta hai."""
 
     def __init__(
         self,
         index: int = 0,
         sentence_text: str = "",
+        story_text: str = "",
         start_time: float = 0.0,
         end_time: float = 3.0,
         media_path: Optional[str] = None,
@@ -58,15 +134,22 @@ class MatchedItem:
             plan_item = kwargs.pop("plan_entry")
         if "scene" in kwargs and plan_item is None:
             plan_item = kwargs.pop("scene")
+        if "image" in kwargs and plan_item is None:
+            plan_item = kwargs.pop("image")
 
-        self.index: int = int(kwargs.pop("entry_index", kwargs.pop("scene_index", kwargs.pop("plan_index", index))))
+        self.index: int = int(
+            kwargs.pop("entry_index", kwargs.pop("scene_index", kwargs.pop("plan_index", index)))
+        )
         self.entry_index: int = self.index
         self.plan_index: int = self.index
         self.scene_index: int = self.index
+        self.image_index: int = self.index
         self.order: int = self.index
 
         self.start_time: float = max(0.0, float(start_time or 0.0))
-        self.end_time: float = max(self.start_time + 0.2, float(end_time or (self.start_time + 3.0)))
+        self.end_time: float = max(
+            self.start_time + 0.1, float(end_time or (self.start_time + 3.0))
+        )
         self.start: float = self.start_time
         self.end: float = self.end_time
         self.start_sec: float = self.start_time
@@ -74,23 +157,37 @@ class MatchedItem:
         self.audio_start: float = self.start_time
         self.audio_end: float = self.end_time
 
-        self.sentence_text: str = str(sentence_text or "")
+        # Image object jiske paas `.file` hamesha mojood rahega (timeline.py line 189 ke liye)
+        image_obj = _ensure_image_object(plan_item, media_path, story_text or sentence_text, self.index)
+        resolved_file = getattr(image_obj, "file", None) or media_path or f"{self.index + 1}.webp"
+
+        self.image: Any = image_obj
+        self.plan_item: Any = plan_item if plan_item is not None else image_obj
+        self.entry: Any = self.plan_item
+        self.plan_entry: Any = self.plan_item
+        self.scene: Any = self.plan_item
+        self.clip: Any = self.plan_item
+        self.item: Any = self.plan_item
+
+        self.media_path: str = str(resolved_file)
+        self.path: str = self.media_path
+        self.file_path: str = self.media_path
+        self.file: str = self.media_path
+        self.filename: str = self.media_path
+        self.image_filename: str = self.media_path
+        self.image_name: str = self.media_path
+        self.image_path: str = self.media_path
+        self.asset: str = self.media_path
+        self.source: str = self.media_path
+        self.media_type: str = str(media_type or "image")
+
+        self.sentence_text: str = str(sentence_text or story_text or "")
         self.text: str = self.sentence_text
         self.matched_text: str = self.sentence_text
         self.transcript_text: str = self.sentence_text
         self.narration: str = self.sentence_text
-
-        self.media_path: Optional[str] = media_path
-        self.path: Optional[str] = media_path
-        self.file_path: Optional[str] = media_path
-        self.file: Optional[str] = media_path
-        self.filename: Optional[str] = media_path
-        self.image: Optional[str] = media_path
-        self.image_name: Optional[str] = media_path
-        self.image_path: Optional[str] = media_path
-        self.asset: Optional[str] = media_path
-        self.source: Optional[str] = media_path
-        self.media_type: str = str(media_type or "image")
+        self.story: str = str(story_text or getattr(image_obj, "story", "") or self.sentence_text)
+        self.story_text: str = self.story
 
         self.clip_start: float = float(clip_start or 0.0)
         self.clip_end: Optional[float] = float(clip_end) if clip_end is not None else None
@@ -104,31 +201,39 @@ class MatchedItem:
         self.is_matched: bool = self.matched
         self.is_fallback: bool = not self.matched
         self.fallback: bool = not self.matched
+        self.used_fallback: bool = not self.matched
         self.method: str = str(method or ("matched" if self.matched else "fallback"))
+        self.match_method: str = self.method
         self.strategy: str = self.method
         self.match_type: str = self.method
 
-        self.plan_item: Optional[Any] = plan_item
-        self.entry: Optional[Any] = plan_item
-        self.plan_entry: Optional[Any] = plan_item
-        self.scene: Optional[Any] = plan_item
-        self.clip: Optional[Any] = plan_item
-        self.item: Optional[Any] = plan_item
-
-        self.sentence: Optional[Any] = sentence
         self.sentences: List[Any] = (
             list(sentences)
             if sentences is not None
             else ([sentence] if sentence is not None else [])
         )
-        self.sentence_indices: List[int] = (
-            list(sentence_indices)
-            if sentence_indices is not None
-            else [self.index]
+        self.matched_sentences: List[Any] = self.sentences
+        self.sentence: Optional[Any] = (
+            sentence if sentence is not None else (self.sentences[0] if self.sentences else None)
         )
-        self.sentence_index: int = self.sentence_indices[0] if self.sentence_indices else self.index
-        self.start_sentence_index: int = self.sentence_indices[0] if self.sentence_indices else self.index
-        self.end_sentence_index: int = self.sentence_indices[-1] if self.sentence_indices else self.index
+        self.start_sentence: Optional[Any] = self.sentences[0] if self.sentences else self.sentence
+        self.end_sentence: Optional[Any] = self.sentences[-1] if self.sentences else self.sentence
+
+        self.sentence_indices: List[int] = (
+            list(sentence_indices) if sentence_indices is not None else [self.index]
+        )
+        self.sentence_index: int = (
+            self.sentence_indices[0] if self.sentence_indices else self.index
+        )
+        self.sentence_idx: int = self.sentence_index
+        self.start_sentence_index: int = (
+            self.sentence_indices[0] if self.sentence_indices else self.index
+        )
+        self.end_sentence_index: int = (
+            self.sentence_indices[-1] if self.sentence_indices else self.index
+        )
+        self.start_sentence_idx: int = self.start_sentence_index
+        self.end_sentence_idx: int = self.end_sentence_index
 
         self.words: List[Any] = list(words) if words is not None else []
         self.warnings: List[str] = []
@@ -139,10 +244,13 @@ class MatchedItem:
 
     @property
     def duration(self) -> float:
-        return max(0.0, float(self.end_time) - float(self.start_time))
+        return max(0.05, float(self.end_time) - float(self.start_time))
 
     def __getattr__(self, name: str) -> Any:
-        # Agar timeline ya renderer PlanEntry ya Sentence ka koi attribute direct maange
+        img_obj = self.__dict__.get("image")
+        if img_obj is not None and hasattr(img_obj, name):
+            return getattr(img_obj, name)
+
         plan_obj = self.__dict__.get("plan_item")
         if plan_obj is not None:
             if isinstance(plan_obj, dict) and name in plan_obj:
@@ -163,18 +271,15 @@ class MatchedItem:
         return {
             "index": self.index,
             "entry_index": self.entry_index,
+            "file": self.file,
+            "media_path": self.media_path,
             "sentence_text": self.sentence_text,
-            "text": self.text,
+            "story": self.story,
             "start": self.start,
             "end": self.end,
             "start_time": self.start_time,
             "end_time": self.end_time,
             "duration": self.duration,
-            "media_path": self.media_path,
-            "image": self.image,
-            "media_type": self.media_type,
-            "clip_start": self.clip_start,
-            "clip_end": self.clip_end,
             "score": self.score,
             "confidence": self.confidence,
             "matched": self.matched,
@@ -186,16 +291,16 @@ class MatchedItem:
 
     def __repr__(self) -> str:
         return (
-            f"MatchedItem(index={self.index}, image={self.media_path!r}, "
+            f"MatchedItem(index={self.index}, file={self.file!r}, "
             f"start={self.start_time:.2f}, end={self.end_time:.2f}, score={self.score:.2f})"
         )
 
 
 class MatchResult(list):
     """
-    Overall story matching result container.
-    Ye list ki tarah iterable bhi hai (for item in match) aur .warnings, .matches,
-    .entries, .segments, .clips, .items jaise saare attributes bhi provide karta hai.
+    Story matching result container.
+    List ki tarah iterate bhi ho sakta hai aur .warnings, .matches, .images,
+    .entries, .segments, .clips, .items properties bhi provide karta hai.
     """
 
     def __init__(
@@ -206,11 +311,15 @@ class MatchResult(list):
         total_duration: Optional[float] = None,
         **kwargs: Any,
     ) -> None:
-        # Agar MatchResult ko single item ki tarah initialize kiya gaya ho
-        if matches is not None and not isinstance(matches, (list, tuple, set)) and isinstance(matches, int):
+        if (
+            matches is not None
+            and not isinstance(matches, (list, tuple, set))
+            and isinstance(matches, int)
+        ):
             single_item = MatchedItem(index=matches, **kwargs)
             super().__init__([single_item])
-            self._sync_single_item_attrs(single_item)
+            for k, v in single_item.__dict__.items():
+                setattr(self, k, v)
             self.warnings: List[str] = list(warnings) if warnings else []
             self.errors: List[str] = []
             self.unmatched: List[Any] = list(unmatched) if unmatched else []
@@ -230,7 +339,9 @@ class MatchResult(list):
         if total_duration is not None:
             self.total_duration = float(total_duration)
         elif item_list:
-            self.total_duration = max(float(getattr(x, "end_time", getattr(x, "end", 0.0))) for x in item_list)
+            self.total_duration = max(
+                float(getattr(x, "end_time", getattr(x, "end", 0.0))) for x in item_list
+            )
         else:
             self.total_duration = 0.0
 
@@ -245,7 +356,9 @@ class MatchResult(list):
         self.total: int = len(item_list)
 
         if item_list:
-            scores = [float(getattr(x, "score", getattr(x, "confidence", 1.0))) for x in item_list]
+            scores = [
+                float(getattr(x, "score", getattr(x, "confidence", 1.0))) for x in item_list
+            ]
             self.mean_confidence: float = sum(scores) / len(scores)
             self.coverage: float = self.matched_count / len(item_list)
         else:
@@ -265,16 +378,24 @@ class MatchResult(list):
         for key, value in kwargs.items():
             setattr(self, key, value)
 
-    def _sync_single_item_attrs(self, item: MatchedItem) -> None:
-        for k, v in item.__dict__.items():
-            setattr(self, k, v)
-
     @property
     def matches(self) -> List[Any]:
         return list(self)
 
     @property
+    def images(self) -> List[Any]:
+        return list(self)
+
+    @property
+    def matched_images(self) -> List[Any]:
+        return list(self)
+
+    @property
     def entries(self) -> List[Any]:
+        return list(self)
+
+    @property
+    def matched_entries(self) -> List[Any]:
         return list(self)
 
     @property
@@ -313,34 +434,6 @@ class MatchResult(list):
     def has_warnings(self) -> bool:
         return bool(self.warnings)
 
-    def format_warnings(self, max_items: int = 20) -> str:
-        if not self.warnings:
-            return ""
-        shown = self.warnings[:max_items]
-        lines = [f"  • {w}" for w in shown]
-        if len(self.warnings) > max_items:
-            lines.append(f"  … and {len(self.warnings) - max_items} more")
-        return f"⚠️ {len(self.warnings)} match warning(s):\n" + "\n".join(lines)
-
-    def summary(self) -> str:
-        return (
-            f"MatchResult(total={len(self)}, matched={self.matched_count}, "
-            f"fallbacks={self.fallback_count}, confidence={self.mean_confidence:.2f}, "
-            f"duration={self.total_duration:.2f}s, warnings={len(self.warnings)})"
-        )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "matches": [x.to_dict() if hasattr(x, "to_dict") else x for x in self],
-            "warnings": list(self.warnings),
-            "unmatched": list(self.unmatched),
-            "total_duration": self.total_duration,
-            "matched_count": self.matched_count,
-            "fallback_count": self.fallback_count,
-            "mean_confidence": self.mean_confidence,
-            "coverage": self.coverage,
-        }
-
 
 def _normalize_text(text: Any) -> str:
     if not text:
@@ -371,23 +464,127 @@ def calculate_similarity(text_a: Any, text_b: Any) -> float:
 text_similarity = calculate_similarity
 
 
-def _unwrap_collection(obj: Any, candidate_attrs: Sequence[str]) -> List[Any]:
-    if obj is None:
+_IGNORED_COLLECTION_ATTRS = {
+    "warnings",
+    "errors",
+    "unmatched",
+    "duplicates",
+    "rejected",
+    "notes",
+    "comments",
+    "raw_lines",
+    "metadata",
+}
+
+
+def _unwrap_plan(plan: Any) -> List[Any]:
+    """
+    ParsedPlan container se saari image/plan entries ki list nikalta hai.
+    `parsed.images`, `parsed.entries`, ya kisi bhi custom list attribute ko detect karta hai.
+    """
+    if plan is None:
         return []
-    if isinstance(obj, (list, tuple)):
-        return list(obj)
-    if isinstance(obj, dict):
+    if isinstance(plan, (list, tuple)):
+        return list(plan)
+
+    candidate_attrs = (
+        "images",
+        "entries",
+        "image_entries",
+        "plan_entries",
+        "scenes",
+        "items",
+        "clips",
+        "blocks",
+        "segments",
+        "shots",
+        "frames",
+        "slides",
+        "visuals",
+        "cards",
+        "lines",
+        "steps",
+        "beats",
+        "pairs",
+        "mappings",
+        "plan",
+    )
+
+    if isinstance(plan, dict):
         for key in candidate_attrs:
-            if key in obj and isinstance(obj[key], (list, tuple)):
-                return list(obj[key])
-        return [obj]
+            val = plan.get(key)
+            if isinstance(val, (list, tuple)) and len(val) > 0:
+                return list(val)
+        for key, val in plan.items():
+            if key not in _IGNORED_COLLECTION_ATTRS and isinstance(val, (list, tuple)) and len(val) > 0:
+                return list(val)
+        return [plan]
+
+    # Step 1: Named attributes check karein (jaise parsed.images ya parsed.entries)
+    empty_fallback: Optional[List[Any]] = None
     for attr in candidate_attrs:
-        val = getattr(obj, attr, None)
+        val = getattr(plan, attr, None)
+        if isinstance(val, (list, tuple)):
+            if len(val) > 0:
+                return list(val)
+            if empty_fallback is None:
+                empty_fallback = []
+
+    # Step 2: Object ke __dict__ aur properties scan karein kisi bhi non-warning list ke liye
+    obj_dict = getattr(plan, "__dict__", {}) or {}
+    for attr, val in obj_dict.items():
+        if attr.startswith("_") or attr in _IGNORED_COLLECTION_ATTRS:
+            continue
+        if isinstance(val, (list, tuple)) and len(val) > 0:
+            if not all(isinstance(x, str) for x in val):
+                return list(val)
+
+    for attr in dir(plan):
+        if attr.startswith("_") or attr in _IGNORED_COLLECTION_ATTRS:
+            continue
+        try:
+            val = getattr(plan, attr)
+        except Exception:
+            continue
+        if isinstance(val, (list, tuple)) and len(val) > 0:
+            if not all(isinstance(x, str) for x in val):
+                return list(val)
+
+    # Step 3: Nested plan object check karein (jaise parsed.plan.images)
+    for nested_attr in ("plan", "parsed_plan", "data", "result"):
+        nested = getattr(plan, nested_attr, None)
+        if nested is not None and nested is not plan:
+            unwrapped = _unwrap_plan(nested)
+            if unwrapped and unwrapped != [nested]:
+                return unwrapped
+
+    if empty_fallback is not None:
+        return empty_fallback
+
+    if isinstance(plan, Iterable) and not isinstance(plan, (str, bytes)):
+        return list(plan)
+
+    return [plan]
+
+
+def _unwrap_sentences(transcript: Any) -> List[Any]:
+    if transcript is None:
+        return []
+    if isinstance(transcript, (list, tuple)):
+        return list(transcript)
+    candidate_attrs = ("sentences", "segments", "items", "lines", "chunks", "words")
+    if isinstance(transcript, dict):
+        for key in candidate_attrs:
+            if isinstance(transcript.get(key), (list, tuple)):
+                return list(transcript[key])
+        return [transcript]
+    for attr in candidate_attrs:
+        val = getattr(transcript, attr, None)
         if isinstance(val, (list, tuple)):
             return list(val)
-    if isinstance(obj, Iterable) and not isinstance(obj, (str, bytes)):
-        return list(obj)
-    return [obj]
+    if isinstance(transcript, Iterable) and not isinstance(transcript, (str, bytes)):
+        return list(transcript)
+    return [transcript]
 
 
 def _extract_sentence_info(item: Any, idx: int) -> Tuple[str, float, float, List[Any]]:
@@ -422,7 +619,9 @@ def _extract_sentence_info(item: Any, idx: int) -> Tuple[str, float, float, List
         or getattr(item, "content", None)
         or ""
     )
-    start = float(getattr(item, "start", getattr(item, "start_time", default_start)) or 0.0)
+    start = float(
+        getattr(item, "start", getattr(item, "start_time", default_start)) or 0.0
+    )
     end_raw = getattr(item, "end", getattr(item, "end_time", None))
     dur_raw = getattr(item, "duration", None)
     if end_raw is not None:
@@ -435,7 +634,10 @@ def _extract_sentence_info(item: Any, idx: int) -> Tuple[str, float, float, List
     return text, start, max(end, start + 0.1), words
 
 
-def _extract_plan_info(item: Any) -> Tuple[Optional[str], str, str, float, Optional[float]]:
+def _extract_plan_info(item: Any, idx: int) -> Tuple[str, str, str, float, Optional[float]]:
+    """
+    Plan entry se (file_name, media_type, story_prompt, clip_start, clip_end) nikalta hai.
+    """
     image_exts = (".webp", ".jpg", ".jpeg", ".png", ".bmp")
     video_exts = (".mp4", ".mov", ".mkv", ".avi", ".webm")
 
@@ -444,36 +646,50 @@ def _extract_plan_info(item: Any) -> Tuple[Optional[str], str, str, float, Optio
         if any(lower.endswith(ext) for ext in image_exts + video_exts):
             m_type = "image" if lower.endswith(image_exts) else "video"
             return item, m_type, "", 0.0, None
-        return None, "image", item, 0.0, None
+        return f"{idx + 1}.webp", "image", item, 0.0, None
 
     if isinstance(item, dict):
+        raw_img = item.get("image")
+        if isinstance(raw_img, dict):
+            path = raw_img.get("file") or raw_img.get("filename") or raw_img.get("path")
+        elif raw_img is not None and not isinstance(raw_img, str):
+            path = getattr(raw_img, "file", None) or getattr(raw_img, "filename", None)
+        else:
+            path = raw_img
+
         path = (
-            item.get("image")
+            path
+            or item.get("file")
+            or item.get("filename")
+            or item.get("image_filename")
             or item.get("image_name")
             or item.get("image_path")
             or item.get("media_path")
             or item.get("path")
             or item.get("file_path")
-            or item.get("file")
-            or item.get("filename")
             or item.get("asset")
             or item.get("source")
             or item.get("video_path")
+            or f"{idx + 1}.webp"
         )
         m_type = item.get("media_type") or item.get("type") or item.get("kind")
         if not m_type:
-            m_type = "video" if (path and str(path).lower().endswith(video_exts)) else "image"
+            m_type = "video" if str(path).lower().endswith(video_exts) else "image"
 
         prompt = str(
-            item.get("text")
-            or item.get("story")
+            item.get("story")
+            or item.get("story_text")
+            or item.get("text")
             or item.get("narration")
             or item.get("script")
             or item.get("voiceover")
             or item.get("sentence")
             or item.get("line")
+            or item.get("quote")
             or item.get("anchor")
+            or item.get("anchor_text")
             or item.get("start_text")
+            or item.get("caption")
             or item.get("description")
             or item.get("prompt")
             or ""
@@ -481,49 +697,110 @@ def _extract_plan_info(item: Any) -> Tuple[Optional[str], str, str, float, Optio
         c_start = float(item.get("clip_start", item.get("in_point", item.get("start", 0.0))) or 0.0)
         c_end_raw = item.get("clip_end", item.get("out_point", item.get("end", None)))
         c_end = float(c_end_raw) if c_end_raw is not None else None
-        return path, str(m_type), prompt, c_start, c_end
+        return str(path), str(m_type), prompt, c_start, c_end
 
-    path = (
-        getattr(item, "image", None)
-        or getattr(item, "image_name", None)
-        or getattr(item, "image_path", None)
-        or getattr(item, "media_path", None)
-        or getattr(item, "path", None)
-        or getattr(item, "file_path", None)
-        or getattr(item, "file", None)
-        or getattr(item, "filename", None)
-        or getattr(item, "asset", None)
-        or getattr(item, "source", None)
-        or getattr(item, "video_path", None)
-    )
+    # Object attribute extraction
+    nested_img = getattr(item, "image", None)
+    path: Optional[str] = None
+    if nested_img is not None and not isinstance(nested_img, str):
+        path = (
+            getattr(nested_img, "file", None)
+            or getattr(nested_img, "filename", None)
+            or getattr(nested_img, "path", None)
+        )
+    elif isinstance(nested_img, str) and nested_img.strip():
+        path = nested_img
+
+    if not path:
+        for attr in (
+            "file",
+            "filename",
+            "image_filename",
+            "image_name",
+            "image_path",
+            "media_path",
+            "path",
+            "file_path",
+            "asset",
+            "source",
+            "video_path",
+        ):
+            val = getattr(item, attr, None)
+            if isinstance(val, str) and val.strip():
+                path = val
+                break
+
+    if not path:
+        path = f"{idx + 1}.webp"
+
     m_type = (
         getattr(item, "media_type", None)
         or getattr(item, "type", None)
         or getattr(item, "kind", None)
     )
     if not m_type:
-        m_type = "video" if (path and str(path).lower().endswith(video_exts)) else "image"
+        m_type = "video" if str(path).lower().endswith(video_exts) else "image"
 
-    prompt = str(
-        getattr(item, "text", None)
-        or getattr(item, "story", None)
-        or getattr(item, "narration", None)
-        or getattr(item, "script", None)
-        or getattr(item, "voiceover", None)
-        or getattr(item, "sentence", None)
-        or getattr(item, "line", None)
-        or getattr(item, "anchor", None)
-        or getattr(item, "start_text", None)
-        or getattr(item, "description", None)
-        or getattr(item, "prompt", None)
-        or ""
-    )
+    prompt = ""
+    for attr in (
+        "story",
+        "story_text",
+        "text",
+        "narration",
+        "script",
+        "voiceover",
+        "sentence",
+        "line",
+        "quote",
+        "anchor",
+        "anchor_text",
+        "start_text",
+        "caption",
+        "description",
+        "prompt",
+        "content",
+    ):
+        val = getattr(item, attr, None)
+        if isinstance(val, str) and val.strip():
+            prompt = val.strip()
+            break
+
+    # Agar nested_img ke paas story/text ho
+    if not prompt and nested_img is not None and not isinstance(nested_img, str):
+        for attr in ("story", "story_text", "text", "description", "caption", "line"):
+            val = getattr(nested_img, attr, None)
+            if isinstance(val, str) and val.strip():
+                prompt = val.strip()
+                break
+
+    # Agar kisi aur string field mein story text ho
+    if not prompt and hasattr(item, "__dict__"):
+        skip_keys = {
+            "file",
+            "filename",
+            "image",
+            "path",
+            "media_path",
+            "type",
+            "media_type",
+            "effect",
+            "motion",
+            "transition",
+            "camera",
+            "zoom",
+            "position",
+        }
+        for k, v in vars(item).items():
+            if not k.startswith("_") and k not in skip_keys and isinstance(v, str) and len(v.strip()) > 3:
+                prompt = v.strip()
+                break
+
     c_start = float(
         getattr(item, "clip_start", getattr(item, "in_point", getattr(item, "start", 0.0))) or 0.0
     )
     c_end_raw = getattr(item, "clip_end", getattr(item, "out_point", getattr(item, "end", None)))
     c_end = float(c_end_raw) if c_end_raw is not None else None
-    return path, str(m_type), prompt, c_start, c_end
+    return str(path), str(m_type), prompt, c_start, c_end
 
 
 def match_plan_to_transcript(
@@ -534,8 +811,8 @@ def match_plan_to_transcript(
     **kwargs: Any,
 ) -> MatchResult:
     """
-    Plan entries aur audio transcript/sentences ko chronological order mein sync karke
-    MatchResult container return karta hai (jisme .warnings, .matches, .entries, etc. hain).
+    Plan entries (images) aur audio transcript sentences ko chronological order mein sync karke
+    MatchResult container return karta hai.
     """
     explicit_duration: Optional[float] = kwargs.pop(
         "total_duration", kwargs.pop("audio_duration", kwargs.pop("duration", None))
@@ -547,17 +824,18 @@ def match_plan_to_transcript(
                 similarity_threshold = float(arg)
             else:
                 explicit_duration = float(arg)
-        elif isinstance(arg, (list, tuple)):
+        elif isinstance(arg, (list, tuple)) and transcript is None:
             transcript = arg
 
     if plan is None:
         plan = (
-            kwargs.pop("plan_entries", None)
+            kwargs.pop("parsed", None)
+            or kwargs.pop("parsed_plan", None)
+            or kwargs.pop("plan_entries", None)
             or kwargs.pop("plan_items", None)
+            or kwargs.pop("images", None)
             or kwargs.pop("entries", None)
             or kwargs.pop("scenes", None)
-            or kwargs.pop("clips", None)
-            or kwargs.pop("items", None)
         )
     if transcript is None:
         transcript = (
@@ -576,12 +854,8 @@ def match_plan_to_transcript(
     elif "min_similarity" in kwargs:
         similarity_threshold = float(kwargs.pop("min_similarity"))
 
-    plan_items = _unwrap_collection(
-        plan, ("entries", "scenes", "items", "clips", "steps", "beats", "plan")
-    )
-    sentence_items = _unwrap_collection(
-        transcript, ("sentences", "segments", "items", "lines", "words", "chunks")
-    )
+    plan_items = _unwrap_plan(plan)
+    sentence_items = _unwrap_sentences(transcript)
 
     if not plan_items and not sentence_items:
         return MatchResult(matches=[], warnings=[], total_duration=0.0)
@@ -595,8 +869,10 @@ def match_plan_to_transcript(
                 MatchedItem(
                     index=idx,
                     sentence_text=s_text,
+                    story_text=s_text,
                     start_time=s_start,
                     end_time=s_end,
+                    media_path=f"{idx + 1}.webp",
                     score=1.0,
                     matched=True,
                     sentence=sent,
@@ -615,12 +891,17 @@ def match_plan_to_transcript(
         cursor = 0.0
         default_step = (explicit_duration / len(plan_items)) if explicit_duration else 3.0
         for idx, p_item in enumerate(plan_items):
-            m_path, m_type, prompt, c_start, c_end = _extract_plan_info(p_item)
-            dur = (c_end - c_start) if (c_end is not None and c_end > c_start) else max(0.5, default_step)
+            m_path, m_type, prompt, c_start, c_end = _extract_plan_info(p_item, idx)
+            dur = (
+                (c_end - c_start)
+                if (c_end is not None and c_end > c_start)
+                else max(0.5, default_step)
+            )
             matched_list.append(
                 MatchedItem(
                     index=idx,
                     sentence_text=prompt,
+                    story_text=prompt,
                     start_time=cursor,
                     end_time=cursor + dur,
                     media_path=m_path,
@@ -630,6 +911,7 @@ def match_plan_to_transcript(
                     score=1.0,
                     matched=True,
                     plan_item=p_item,
+                    sentence_indices=[0],
                     method="proportional",
                 )
             )
@@ -646,10 +928,9 @@ def match_plan_to_transcript(
     audio_end = max(
         explicit_duration or 0.0,
         parsed_sentences[-1][2],
-        audio_start + num_plan * 0.5,
+        audio_start + num_plan * 0.25,
     )
 
-    # Monotonic sentence index mapping taaki timeline hamesha forward direction mein rahe
     assigned_sent_indices: List[int] = []
     scores_list: List[float] = []
     matched_flags: List[bool] = []
@@ -657,15 +938,14 @@ def match_plan_to_transcript(
 
     search_floor = 0
     for p_idx, p_item in enumerate(plan_items):
-        _, _, prompt, _, _ = _extract_plan_info(p_item)
+        _, _, prompt, _, _ = _extract_plan_info(p_item, p_idx)
         expected_s_idx = min(
             num_sent - 1,
             int(round(p_idx * (num_sent - 1) / max(1, num_plan - 1))) if num_plan > 1 else 0,
         )
 
-        # Windowed monotonic search around expected position
-        win_start = max(search_floor, expected_s_idx - 4)
-        win_end = min(num_sent - 1, max(win_start, expected_s_idx + 6))
+        win_start = max(search_floor, expected_s_idx - 5)
+        win_end = min(num_sent - 1, max(win_start, expected_s_idx + 7))
 
         best_score = -1.0
         best_s_idx = expected_s_idx
@@ -674,7 +954,7 @@ def match_plan_to_transcript(
             for s_idx in range(win_start, win_end + 1):
                 s_text = parsed_sentences[s_idx][0]
                 sim = calculate_similarity(prompt, s_text)
-                proximity_bonus = max(0.0, 0.08 - 0.015 * abs(s_idx - expected_s_idx))
+                proximity_bonus = max(0.0, 0.08 - 0.012 * abs(s_idx - expected_s_idx))
                 total_score = sim + proximity_bonus
                 if total_score > best_score:
                     best_score = total_score
@@ -692,25 +972,20 @@ def match_plan_to_transcript(
             final_score = max(0.5, best_score) if prompt and best_score > 0 else 1.0
             method_name = "interpolated" if prompt else "sequential"
 
+        if p_idx == 0:
+            chosen_idx = 0
+        elif p_idx == num_plan - 1:
+            chosen_idx = max(chosen_idx, num_sent - 1)
+
         assigned_sent_indices.append(chosen_idx)
         scores_list.append(final_score)
         matched_flags.append(is_matched)
         methods_list.append(method_name)
 
-        # Agle plan item ke liye search floor ko smoothly advance karein
         max_allowed_floor = int(round((p_idx + 1) * (num_sent - 1) / max(1, num_plan)))
         search_floor = min(num_sent - 1, min(chosen_idx, max_allowed_floor))
 
-    # Sentence timings se contiguous, non-overlapping [start, end] intervals banayein
-    raw_starts: List[float] = []
-    raw_ends: List[float] = []
-    for p_idx in range(num_plan):
-        s_idx = assigned_sent_indices[p_idx]
-        _, s_start, s_end, _ = parsed_sentences[s_idx]
-        raw_starts.append(s_start)
-        raw_ends.append(s_end)
-
-    # Contiguous monotonic timeline boundaries ensure karein
+    # Contiguous monotonic timeline boundaries compute karein
     final_intervals: List[Tuple[float, float]] = []
     i = 0
     while i < num_plan:
@@ -726,12 +1001,12 @@ def match_plan_to_transcript(
 
         if j + 1 < num_plan:
             next_s_idx = assigned_sent_indices[j + 1]
-            seg_end = max( parsed_sentences[s_idx][2], parsed_sentences[next_s_idx][1] )
+            seg_end = max(parsed_sentences[s_idx][2], parsed_sentences[next_s_idx][1])
         else:
             seg_end = audio_end
 
-        if seg_end <= seg_start + 0.2 * group_count:
-            seg_end = seg_start + max(0.5 * group_count, 0.3 * group_count)
+        if seg_end <= seg_start + 0.1 * group_count:
+            seg_end = seg_start + max(0.25 * group_count, 0.2 * group_count)
 
         step = (seg_end - seg_start) / group_count
         for k in range(group_count):
@@ -743,15 +1018,32 @@ def match_plan_to_transcript(
 
     matched_items: List[MatchedItem] = []
     for p_idx, p_item in enumerate(plan_items):
-        m_path, m_type, prompt, c_start, c_end = _extract_plan_info(p_item)
+        m_path, m_type, prompt, c_start, c_end = _extract_plan_info(p_item, p_idx)
         s_idx = assigned_sent_indices[p_idx]
-        s_text, _, _, s_words = parsed_sentences[s_idx]
-        sent_obj = sentence_items[s_idx]
+
+        # Agar agle plan entry tak multiple sentences span ho rahe hon toh unhe include karein
+        if p_idx + 1 < num_plan and assigned_sent_indices[p_idx + 1] > s_idx + 1:
+            end_s_idx = assigned_sent_indices[p_idx + 1] - 1
+        elif p_idx == num_plan - 1 and s_idx < num_sent - 1:
+            end_s_idx = num_sent - 1
+        else:
+            end_s_idx = s_idx
+
+        sent_idx_range = list(range(s_idx, max(s_idx, end_s_idx) + 1))
+        sent_objs = [sentence_items[idx_i] for idx_i in sent_idx_range]
+        combined_sent_text = " ".join(
+            parsed_sentences[idx_i][0] for idx_i in sent_idx_range if parsed_sentences[idx_i][0]
+        ).strip()
+        combined_words: List[Any] = []
+        for idx_i in sent_idx_range:
+            combined_words.extend(parsed_sentences[idx_i][3])
+
         start_t, end_t = final_intervals[p_idx]
 
         item = MatchedItem(
             index=p_idx,
-            sentence_text=s_text or prompt,
+            sentence_text=combined_sent_text or prompt,
+            story_text=prompt or combined_sent_text,
             start_time=start_t,
             end_time=end_t,
             media_path=m_path,
@@ -761,10 +1053,10 @@ def match_plan_to_transcript(
             score=scores_list[p_idx],
             matched=matched_flags[p_idx],
             plan_item=p_item,
-            sentence=sent_obj,
-            sentences=[sent_obj],
-            sentence_indices=[s_idx],
-            words=s_words,
+            sentence=sent_objs[0] if sent_objs else None,
+            sentences=sent_objs,
+            sentence_indices=sent_idx_range,
+            words=combined_words,
             method=methods_list[p_idx],
         )
         matched_items.append(item)
@@ -795,7 +1087,9 @@ class StoryMatcher:
     def calculate_similarity(self, text_a: str, text_b: str) -> float:
         return calculate_similarity(text_a, text_b)
 
-    def match(self, plan: Any = None, transcript: Any = None, *args: Any, **kwargs: Any) -> MatchResult:
+    def match(
+        self, plan: Any = None, transcript: Any = None, *args: Any, **kwargs: Any
+    ) -> MatchResult:
         return match_plan_to_transcript(
             plan,
             transcript,
@@ -820,6 +1114,8 @@ class StoryMatcher:
 MatchedSegment = MatchedItem
 MatchedEntry = MatchedItem
 MatchedClip = MatchedItem
+MatchedImage = MatchedItem
+ImageMatch = MatchedItem
 SceneMatch = MatchedItem
 match_story = match_plan_to_transcript
 match_transcript_to_plan = match_plan_to_transcript
@@ -832,6 +1128,8 @@ __all__ = [
     "MatchedSegment",
     "MatchedEntry",
     "MatchedClip",
+    "MatchedImage",
+    "ImageMatch",
     "SceneMatch",
     "MatchResult",
     "StoryMatcher",
