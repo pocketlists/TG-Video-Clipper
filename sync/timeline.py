@@ -165,6 +165,21 @@ def _scene_file(matched: Any) -> str:
     return str(name).strip() if name else ""
 
 
+def _merge_adjacent(scenes: List[RenderScene], min_duration: float = 0.8) -> List[RenderScene]:
+    merged: List[RenderScene] = []
+    for scene in scenes:
+        if merged and merged[-1].image_filename == scene.image_filename:
+            prev = merged[-1]
+            prev.end = scene.end
+            prev.text = f"{prev.text} {scene.text}".strip()
+            prev.warnings.extend(scene.warnings)
+        elif merged and scene.end - scene.start < min_duration:
+            merged[-1].end = scene.end
+        else:
+            merged.append(scene)
+    return merged
+
+
 def build_scenes_from_match(
     plan: EditPlan,
     match: MatchResult,
@@ -215,6 +230,7 @@ def build_scenes_from_match(
 
         scenes.append(scene)
 
+    scenes = _merge_adjacent(scenes)
     _validate_spans(scenes)
 
     logger.info(
