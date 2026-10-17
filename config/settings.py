@@ -1,0 +1,50 @@
+{
+  "quality_presets": {
+    "360p":  {"width": 640,  "height": 360,  "fps": 30, "crf": 24, "preset": "fast",   "label": "360p — fastest"},
+    "480p":  {"width": 854,  "height": 480,  "fps": 30, "crf": 23, "preset": "fast",   "label": "480p — fast"},
+    "720p":  {"width": 1280, "height": 720,  "fps": 60, "crf": 21, "preset": "medium", "label": "720p — balanced"},
+    "1080p": {"width": 1920, "height": 1080, "fps": 60, "crf": 20, "preset": "medium", "label": "1080p — best"}
+  },
+  "quality_order": ["360p", "480p", "720p", "1080p"],
+  "default_quality": "1080p",
+
+  "transcriber": {
+    "local_whisper_model": "base",
+    "gemini_fallback_models": [
+      "gemini-2.5-flash",
+      "gemini-2.5-flash-lite",
+      "gemini-2.0-flash"
+    ],
+    "timeout_seconds": 1800
+  },
+
+  "matcher": {
+    "model": "gemini-2.5-flash",
+    "fallback_models": ["gemini-2.5-flash-lite", "gemini-2.0-flash"],
+    "batch_size": 40,
+    "min_confidence": 0.55,
+    "allow_fuzzy_fallback": true
+  },
+
+  "render": {
+    "supersample": 4,
+    "zoom_amount": 0.16,
+    "pan_zoom_level": 1.14
+  },
+
+  "vision": {
+    "engine": "none",
+    "lang": "devanagari",
+    "max_image_side": 1600,
+    "timeout_per_image_seconds": 10
+  },
+
+  "intake": {
+    "debounce_seconds": 15,
+    "max_upload_mb": 45,
+    "extract_max_files": 5000,
+    "extract_max_total_mb": 2048,
+    "extract_max_single_mb": 500,
+    "extract_max_depth": 2
+  }
+}
