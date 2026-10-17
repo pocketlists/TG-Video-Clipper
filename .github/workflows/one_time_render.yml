@@ -1,7 +1,14 @@
-name: One-Time Manga Video Renderer (Bot Wait)
+name: One-Time Story Video Renderer
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: one-time-render
+  cancel-in-progress: false
 
 jobs:
   run-bot:
@@ -17,26 +24,37 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Cache Whisper model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/whisper
+          key: whisper-${{ runner.os }}-base
+
       - name: Install FFmpeg
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y --no-install-recommends ffmpeg
 
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run One-Time Bot
+      - name: Run Bot
         env:
           PYTHONUNBUFFERED: "1"
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          SARVAM_API_KEY: ${{ secrets.SARVAM_API_KEY }}
           OWNER_CHAT_ID: ${{ secrets.OWNER_CHAT_ID }}
-          FREESOUND_API_KEY: ${{ secrets.FREESOUND_API_KEY }}
         run: |
-          python -u one_time_bot.py
+          python -u main.py
