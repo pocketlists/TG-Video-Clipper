@@ -55,9 +55,12 @@ class Sentence:
 # Text normalization used by both this module and sync/story_matcher.py
 # ---------------------------------------------------------------------------
 
-_PUNCT_RE = re.compile(
-    r"[.,;:!?\"'""''`~@#$%^&*()_+=\[\]{}<>/\\|।॥…—–-]+",
-)
+# All ASCII punctuation + curly Unicode quotes + ellipsis / em-dash /
+# en-dash + Devanagari danda. re.escape() handles every char-class
+# escaping so there is no raw-string fragility and no SyntaxWarning.
+_ASCII_PUNCT = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+_UNICODE_PUNCT = "\u2018\u2019\u201c\u201d\u2026\u2014\u2013\u0964\u0965"
+_PUNCT_RE = re.compile("[" + re.escape(_ASCII_PUNCT + _UNICODE_PUNCT) + "]+")
 _WS_RE = re.compile(r"\s+")
 
 
@@ -267,7 +270,6 @@ def build_sentences(transcription: TranscriptionResult) -> List[Sentence]:
     if not sentences:
         sentences = _from_segments(transcription.segments, duration)
     if not sentences and transcription.words:
-        # Extremely defensive: words existed but produced nothing usable
         sentences = _from_words(transcription.words, duration)
 
     sentences = _sanitize(sentences, duration)
