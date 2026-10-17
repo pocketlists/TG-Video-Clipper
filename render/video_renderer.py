@@ -21,9 +21,11 @@ from config.settings import (
 )
 from media.detector import classify
 from media.formats import CATEGORY_IMAGE
+from collections import Counter, defaultdict
+
+from media.panel_cropper import assign_panels, detect_panels, plan_shots
+from render.compositor import render_shot
 from render.encoder import (
-    standardize_image,
-    create_clip,
     concat_clips,
     assemble,
     verify_output,
@@ -352,68 +354,78 @@ def render(
     clip_paths: List[Path] = []
     concat_path = temp_dir / "concat.mp4"
 
+    resolved: List[Path] = []
+    checked = set()
+
+    for scene in prepared:
+        path = _resolve_image(media_dir, scene["filename"])
+
+        if path not in checked:
+            _validate_image(path, scene["filename"])
+            checked.add(path)
+
+        resolved.append(path)
+
+    uses = Counter(resolved)
+    used: Dict[Path, int] = defaultdict(int)
+    panel_cache: Dict[Path, List] = {}
+
     try:
         for idx, scene in enumerate(prepared):
             if progress:
                 progress(f"Rendering clip {idx + 1}/{total}")
 
-            image_path = _resolve_image(
-                media_dir,
-                scene["filename"],
+            image_path = resolved[idx]
+
+            if image_path not in panel_cache:
+                panel_cache[image_path] = detect_panels(image_path)
+
+            group = assign_panels(
+                panel_cache[image_path],
+                uses[image_path],
+                used[image_path],
             )
+            used[image_path] += 1
 
-            _validate_image(
-                image_path,
-                scene["filename"],
-            )
+            shots = plan_shots(group, scene["total_frames"], preset.fps)
 
-            standardized = temp_dir / f"std_{idx:04d}.png"
-            clip_path = temp_dir / f"clip_{idx:04d}.mp4"
+            for sub, (box, frames) in enumerate(shots):
+                clip_path = temp_dir / f"clip_{idx:04d}_{sub:02d}.mp4"
+                clip_paths.append(clip_path)
 
-            try:
-                standardize_image(
+                render_shot(
                     image_path,
-                    standardized,
-                    preset.width,
-                    preset.height,
-                )
-
-                create_clip(
-                    standardized,
+                    box,
+                    scene["effect"],
                     clip_path,
-                    effect=scene["effect"],
                     width=preset.width,
                     height=preset.height,
                     fps=preset.fps,
-                    total_frames=scene["total_frames"],
+                    total_frames=frames,
                     crf=preset.crf,
                     preset=preset.encoder_preset,
                 )
 
-            finally:
-                standardized.unlink(missing_ok=True)
-
-            if (
-                not clip_path.is_file()
-                or clip_path.stat().st_size < 512
-            ):
-                raise PipelineError(
-                    STAGE_RENDER,
-                    (
-                        f"clip {idx + 1} for "
-                        f"{scene['filename']!r} produced no valid output"
-                    ),
-                )
-
-            clip_paths.append(clip_path)
+                if (
+                    not clip_path.is_file()
+                    or clip_path.stat().st_size < 512
+                ):
+                    raise PipelineError(
+                        STAGE_RENDER,
+                        (
+                            f"clip {idx + 1}.{sub} for "
+                            f"{scene['filename']!r} produced no valid output"
+                        ),
+                    )
 
             logger.info(
-                "Clip %s/%s: %s | %.3fs | %s frames | effect=%s",
+                "Clip %s/%s: %s | %.3fs | %s frames | %s shot(s) | effect=%s",
                 idx + 1,
                 total,
                 scene["filename"],
                 scene["duration"],
                 scene["total_frames"],
+                len(shots),
                 scene["effect"],
             )
 
