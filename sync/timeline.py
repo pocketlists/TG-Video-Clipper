@@ -151,8 +151,18 @@ def _scene_text(scene: MatchedScene, sentences: List[Sentence]) -> str:
     if pieces:
         return " ".join(pieces)
 
-    story_line = getattr(scene.image, "story_line", "")
+    story_line = getattr(getattr(scene, "plan_item", None), "story_line", "")
     return story_line.strip() if isinstance(story_line, str) else ""
+
+
+def _plan_image(matched: Any) -> Any:
+    plan_item = getattr(matched, "plan_item", None)
+    return plan_item if hasattr(plan_item, "file") else None
+
+
+def _scene_file(matched: Any) -> str:
+    name = getattr(_plan_image(matched), "file", None) or getattr(matched, "media_path", None)
+    return str(name).strip() if name else ""
 
 
 def build_scenes_from_match(
@@ -164,29 +174,32 @@ def build_scenes_from_match(
     if not match.scenes:
         raise PipelineError(STAGE_SYNC, "matcher produced no scenes")
 
-    images = [item.image for item in match.scenes]
+    images = [_plan_image(item) for item in match.scenes]
     effects = _assign_effects(images)
     scenes: List[RenderScene] = []
 
     for matched, effect in zip(match.scenes, effects):
+        filename = _scene_file(matched)
+        if not filename:
+            raise PipelineError(STAGE_SYNC, "matched scene has no image file")
         try:
             start = float(matched.start)
             end = float(matched.end)
         except (TypeError, ValueError) as exc:
             raise PipelineError(
                 STAGE_SYNC,
-                f"invalid timestamps for image {matched.image.file}",
+                f"invalid timestamps for image {filename}",
             ) from exc
 
         if start < 0 or end <= start:
             raise PipelineError(
                 STAGE_SYNC,
-                f"invalid scene span for {matched.image.file}: "
+                f"invalid scene span for {filename}: "
                 f"{start:.3f}–{end:.3f}",
             )
 
         scene = RenderScene(
-            image_filename=matched.image.file,
+            image_filename=filename,
             start=start,
             end=end,
             effect=effect,
@@ -194,7 +207,7 @@ def build_scenes_from_match(
             source="plan",
         )
 
-        transition = getattr(matched.image, "transition", None)
+        transition = getattr(_plan_image(matched), "transition", None)
         if transition:
             scene.warnings.append(
                 f"transition '{transition}' is not supported and was ignored"
@@ -207,7 +220,7 @@ def build_scenes_from_match(
     logger.info(
         "built %d render scenes from plan (method=%s)",
         len(scenes),
-        match.method,
+        ",".join(sorted({str(getattr(m, "method", "plan")) for m in match.scenes})),
     )
     return scenes
 
