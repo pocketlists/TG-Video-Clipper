@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 from planning.plan_parser import EditPlan, PlanImage
 from utils.error_handler import PipelineError, STAGE_SYNC
@@ -32,14 +32,14 @@ EFFECTS_POOL = [
 
 @dataclass
 class RenderScene:
-    """One image and its assigned time span in the rendered video."""
-
     image_filename: str
     start: float
     end: float
     effect: str
     text: str = ""
     source: str = "plan"
+    crop: Optional[Tuple[int, int, int, int]] = None
+    transition: Optional[str] = None
     warnings: List[str] = field(default_factory=list)
 
     def duration(self) -> float:
@@ -52,16 +52,22 @@ class RenderScene:
             "end": self.end,
             "effect": self.effect,
             "text": self.text,
+            "crop": self.crop,
+            "transition": self.transition,
         }
 
 
-def _effect_from_plan(effects: Dict[str, Any]) -> Optional[str]:
+def _effect_from_plan(effects: Any) -> Optional[str]:
+    if isinstance(effects, str):
+        clean = effects.strip()
+        return clean if clean in EFFECTS_POOL else None
+
     if not isinstance(effects, dict):
         return None
 
     explicit = effects.get("effect")
-    if isinstance(explicit, str) and explicit in EFFECTS_POOL:
-        return explicit
+    if isinstance(explicit, str) and explicit.strip() in EFFECTS_POOL:
+        return explicit.strip()
 
     pan = effects.get("pan")
     if isinstance(pan, str):
@@ -107,12 +113,10 @@ def _assign_effects(
             if isinstance(candidate, str) and candidate in EFFECTS_POOL:
                 effect = candidate
 
-        if effect is None:
-            eff_dict = getattr(image, "effects", None)
-            if isinstance(eff_dict, dict):
-                candidate = _effect_from_plan(eff_dict)
-                if candidate in EFFECTS_POOL:
-                    effect = candidate
+        if effect is None and image is not None:
+            candidate = _effect_from_plan(getattr(image, "effects", None))
+            if candidate in EFFECTS_POOL:
+                effect = candidate
 
         if effect is None:
             choices = [item for item in EFFECTS_POOL if item != previous]
@@ -127,25 +131,23 @@ def _assign_effects(
 
 
 def _scene_text(scene: MatchedScene, sentences: List[Sentence]) -> str:
+    plan_item = getattr(scene, "plan_item", None) or getattr(scene, "image", None)
+    story_line = getattr(plan_item, "story_line", "") or getattr(plan_item, "story", "")
+    if isinstance(story_line, str) and story_line.strip():
+        return story_line.strip()
+
     pieces: List[str] = []
-    indices = getattr(scene, "sentence_indices", [])
-    for index in indices:
+    for index in getattr(scene, "sentence_indices", []):
         if 0 <= index < len(sentences):
             text = sentences[index].text.strip()
             if text:
                 pieces.append(text)
 
-    if pieces:
-        return " ".join(pieces)
-
-    plan_item = getattr(scene, "plan_item", None) or getattr(scene, "image", None)
-    story_line = getattr(plan_item, "story_line", "") or getattr(plan_item, "story", "")
-    return str(story_line).strip() if story_line else ""
+    return " ".join(pieces)
 
 
 def _plan_image(matched: Any) -> Any:
-    plan_item = getattr(matched, "plan_item", None) or getattr(matched, "image", None)
-    return plan_item
+    return getattr(matched, "plan_item", None) or getattr(matched, "image", None)
 
 
 def _scene_file(matched: Any) -> str:
@@ -159,16 +161,40 @@ def _scene_file(matched: Any) -> str:
     return str(name).strip() if name else ""
 
 
-def _merge_adjacent(scenes: List[RenderScene], min_duration: float = 0.8) -> List[RenderScene]:
+def _scene_crop(matched: Any) -> Optional[Tuple[int, int, int, int]]:
+    img = _plan_image(matched)
+    crop = getattr(img, "crop", None) or getattr(matched, "crop", None)
+    if isinstance(crop, (list, tuple)) and len(crop) == 4:
+        try:
+            x1, y1, x2, y2 = (int(round(float(v))) for v in crop)
+            if x2 > x1 and y2 > y1:
+                return (max(0, x1), max(0, y1), x2, y2)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _merge_adjacent(
+    scenes: List[RenderScene],
+    min_duration: float = 0.25,
+    preserve_distinct_entries: bool = False,
+) -> List[RenderScene]:
     merged: List[RenderScene] = []
     for scene in scenes:
-        if merged and merged[-1].image_filename == scene.image_filename:
+        if (
+            merged
+            and not preserve_distinct_entries
+            and merged[-1].image_filename == scene.image_filename
+            and merged[-1].crop == scene.crop
+            and merged[-1].effect == scene.effect
+            and scene.crop is None
+        ):
             prev = merged[-1]
             prev.end = scene.end
             if scene.text:
                 prev.text = f"{prev.text} {scene.text}".strip()
             prev.warnings.extend(scene.warnings)
-        elif merged and scene.end - scene.start < min_duration:
+        elif merged and (scene.end - scene.start) < min_duration:
             merged[-1].end = scene.end
         else:
             merged.append(scene)
@@ -180,13 +206,23 @@ def build_scenes_from_match(
     match: MatchResult,
     sentences: List[Sentence],
 ) -> List[RenderScene]:
-    scenes_source = getattr(match, "scenes", None) or getattr(match, "matches", None) or list(match)
+    scenes_source = (
+        getattr(match, "scenes", None)
+        or getattr(match, "matches", None)
+        or list(match)
+    )
     if not scenes_source:
         raise PipelineError(STAGE_SYNC, "matcher produced no scenes")
 
     images = [_plan_image(item) for item in scenes_source]
     effects = _assign_effects(images)
     scenes: List[RenderScene] = []
+
+    has_explicit_plan_data = (
+        str(getattr(match, "method", "")) == "explicit"
+        or any(_scene_crop(m) is not None for m in scenes_source)
+        or any(getattr(_plan_image(m), "start_time", None) is not None for m in scenes_source)
+    )
 
     for matched, effect in zip(scenes_source, effects):
         filename = _scene_file(matched)
@@ -208,25 +244,27 @@ def build_scenes_from_match(
                 f"invalid scene span for {filename}: {start:.3f}–{end:.3f}",
             )
 
-        scene = RenderScene(
-            image_filename=filename,
-            start=start,
-            end=end,
-            effect=effect,
-            text=_scene_text(matched, sentences),
-            source="plan",
-        )
-
         plan_img = _plan_image(matched)
         transition = getattr(plan_img, "transition", None) if plan_img else None
-        if transition:
-            scene.warnings.append(
-                f"transition '{transition}' is not supported and was ignored"
+
+        scenes.append(
+            RenderScene(
+                image_filename=filename,
+                start=start,
+                end=end,
+                effect=effect,
+                text=_scene_text(matched, sentences),
+                source="plan",
+                crop=_scene_crop(matched),
+                transition=transition,
             )
+        )
 
-        scenes.append(scene)
-
-    scenes = _merge_adjacent(scenes)
+    scenes = _merge_adjacent(
+        scenes,
+        min_duration=0.25 if has_explicit_plan_data else 0.8,
+        preserve_distinct_entries=has_explicit_plan_data,
+    )
     _validate_spans(scenes)
 
     logger.info(
@@ -281,7 +319,6 @@ def build_scenes_from_legacy_timeline(
         )
 
     scenes: List[RenderScene] = []
-
     for index, entry in enumerate(timeline):
         if isinstance(entry, dict):
             scene = _legacy_entry_to_scene(entry, index)
@@ -339,7 +376,6 @@ def build_scenes_from_legacy_timeline(
         PlanImage(file=scene.image_filename, effects={}, raw={})
         for scene in scenes
     ]
-
     for scene, effect in zip(scenes, _assign_effects(fake_images)):
         scene.effect = effect
 
@@ -350,12 +386,14 @@ def build_scenes_from_legacy_timeline(
 
 def _validate_spans(scenes: List[RenderScene]) -> None:
     previous_end = 0.0
-
     for index, scene in enumerate(scenes):
         if scene.start < 0:
             raise PipelineError(STAGE_SYNC, f"scene {index} has negative start timestamp")
         if scene.end <= scene.start:
-            raise PipelineError(STAGE_SYNC, f"scene {index} ({scene.image_filename}) has zero/negative duration")
+            raise PipelineError(
+                STAGE_SYNC,
+                f"scene {index} ({scene.image_filename}) has zero/negative duration",
+            )
         if index > 0 and scene.start < previous_end - 1e-6:
             raise PipelineError(STAGE_SYNC, f"scene {index} overlaps previous scene")
         previous_end = scene.end
