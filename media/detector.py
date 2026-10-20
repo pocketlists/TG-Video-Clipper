@@ -1,59 +1,78 @@
-"""
-media/detector.py
-Combines extension, magic-byte header, parsed JSON content and ffprobe
-metadata to classify a single file. Returns a DetectionResult; never
-raises on a bad file — problems are reported in result.warnings.
-"""
-
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from media.formats import (
-    CATEGORY_IMAGE, CATEGORY_AUDIO, CATEGORY_VIDEO, CATEGORY_ARCHIVE,
-    CATEGORY_JSON, CATEGORY_STRUCTURED, CATEGORY_SUBTITLE, CATEGORY_TEXT,
-    CATEGORY_FONT, CATEGORY_UNKNOWN,
-    specs_for_filename, specs_for_header, category_from_extension_only,
-    SUBTITLE_EXTENSIONS, TEXT_EXTENSIONS, STRUCTURED_EXTENSIONS,
+    CATEGORY_ARCHIVE,
+    CATEGORY_AUDIO,
+    CATEGORY_FONT,
+    CATEGORY_IMAGE,
+    CATEGORY_JSON,
+    CATEGORY_STRUCTURED,
+    CATEGORY_SUBTITLE,
+    CATEGORY_TEXT,
+    CATEGORY_UNKNOWN,
+    CATEGORY_VIDEO,
     JSON_EXTENSIONS,
+    STRUCTURED_EXTENSIONS,
+    SUBTITLE_EXTENSIONS,
+    TEXT_EXTENSIONS,
+    category_from_extension_only,
+    specs_for_filename,
+    specs_for_header,
 )
 
-
-ROLE_IMAGE           = "image"
-ROLE_ARCHIVE         = "archive"
-ROLE_AUDIO           = "audio"
-ROLE_VIDEO           = "video"
-ROLE_EDIT_PLAN       = "edit_plan"
+ROLE_IMAGE = "image"
+ROLE_ARCHIVE = "archive"
+ROLE_AUDIO = "audio"
+ROLE_VIDEO = "video"
+ROLE_EDIT_PLAN = "edit_plan"
 ROLE_TIMELINE_LEGACY = "timeline_legacy"
-ROLE_JSON_OTHER      = "json_other"
-ROLE_TEXT            = "text"
-ROLE_SUBTITLE        = "subtitle"
-ROLE_FONT            = "font"
-ROLE_STRUCTURED      = "structured"
-ROLE_UNKNOWN         = "unknown"
+ROLE_JSON_OTHER = "json_other"
+ROLE_TEXT = "text"
+ROLE_SUBTITLE = "subtitle"
+ROLE_FONT = "font"
+ROLE_STRUCTURED = "structured"
+ROLE_UNKNOWN = "unknown"
 
 ROLE_BY_CATEGORY = {
-    CATEGORY_IMAGE:      ROLE_IMAGE,
-    CATEGORY_AUDIO:      ROLE_AUDIO,
-    CATEGORY_VIDEO:      ROLE_VIDEO,
-    CATEGORY_ARCHIVE:    ROLE_ARCHIVE,
-    CATEGORY_TEXT:       ROLE_TEXT,
-    CATEGORY_SUBTITLE:   ROLE_SUBTITLE,
-    CATEGORY_FONT:       ROLE_FONT,
+    CATEGORY_IMAGE: ROLE_IMAGE,
+    CATEGORY_AUDIO: ROLE_AUDIO,
+    CATEGORY_VIDEO: ROLE_VIDEO,
+    CATEGORY_ARCHIVE: ROLE_ARCHIVE,
+    CATEGORY_TEXT: ROLE_TEXT,
+    CATEGORY_SUBTITLE: ROLE_SUBTITLE,
+    CATEGORY_FONT: ROLE_FONT,
     CATEGORY_STRUCTURED: ROLE_STRUCTURED,
-    CATEGORY_JSON:       ROLE_JSON_OTHER,
-    CATEGORY_UNKNOWN:    ROLE_UNKNOWN,
+    CATEGORY_JSON: ROLE_JSON_OTHER,
+    CATEGORY_UNKNOWN: ROLE_UNKNOWN,
 }
 
 AUDIO_NARRATION_HINTS = (
-    "narration", "voice", "voiceover", "tts", "speech", "dialogue",
+    "narration",
+    "voice",
+    "voiceover",
+    "tts",
+    "speech",
+    "dialogue",
 )
 AUDIO_MUSIC_HINTS = (
-    "music", "bgm", "background", "soundtrack", "ost", "score", "instrumental",
+    "music",
+    "bgm",
+    "background",
+    "soundtrack",
+    "ost",
+    "score",
+    "instrumental",
+)
+
+_QUOTE_REPAIR_RE = re.compile(
+    r'^(\s*"(?:story_line|description|notes|text|reason)"\s*:\s*")(.*)("(\s*,?)\s*)$'
 )
 
 
@@ -73,10 +92,6 @@ class DetectionResult:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# Extension helpers
-# ---------------------------------------------------------------------------
-
 _KNOWN_EXTS_CACHE: Optional[Tuple[str, ...]] = None
 
 
@@ -84,6 +99,7 @@ def _known_extensions() -> Tuple[str, ...]:
     global _KNOWN_EXTS_CACHE
     if _KNOWN_EXTS_CACHE is None:
         from media.formats import FORMATS
+
         exts = set()
         for spec in FORMATS:
             exts.update(spec.extensions)
@@ -103,10 +119,6 @@ def _display_extension(filename: str) -> str:
     return Path(filename).suffix.lower() or ""
 
 
-# ---------------------------------------------------------------------------
-# Low-level readers
-# ---------------------------------------------------------------------------
-
 def _read_header(path: Path, n: int = 1024) -> bytes:
     try:
         with open(path, "rb") as f:
@@ -116,9 +128,7 @@ def _read_header(path: Path, n: int = 1024) -> bytes:
 
 
 def _looks_like_text(header: bytes) -> bool:
-    if not header:
-        return False
-    if b"\x00" in header[:512]:
+    if not header or b"\x00" in header[:512]:
         return False
     try:
         header.decode("utf-8")
@@ -131,16 +141,22 @@ def _looks_like_text(header: bytes) -> bool:
             return False
 
 
-# ---------------------------------------------------------------------------
-# ffprobe
-# ---------------------------------------------------------------------------
-
 def _probe(path: Path) -> Dict[str, Any]:
     try:
         proc = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_format", "-show_streams", str(path)],
-            capture_output=True, text=True, timeout=30,
+            [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return {}
@@ -158,9 +174,7 @@ def _parse_fps(rate: Optional[str]) -> Optional[float]:
     try:
         num, den = rate.split("/", 1)
         n, d = float(num), float(den)
-        if d == 0:
-            return None
-        return round(n / d, 3)
+        return None if d == 0 else round(n / d, 3)
     except (TypeError, ValueError):
         return None
 
@@ -173,16 +187,15 @@ def _audio_metadata(probe: Dict[str, Any]) -> Dict[str, Any]:
         duration = float(fmt.get("duration", 0) or 0)
     except (TypeError, ValueError):
         duration = 0.0
-    sample_rate: Optional[int]
     try:
         sample_rate = int(first.get("sample_rate", 0) or 0) or None
     except (TypeError, ValueError):
         sample_rate = None
     return {
-        "duration":     duration,
-        "channels":     first.get("channels"),
-        "sample_rate":  sample_rate,
-        "codec":        first.get("codec_name"),
+        "duration": duration,
+        "channels": first.get("channels"),
+        "sample_rate": sample_rate,
+        "codec": first.get("codec_name"),
         "audio_streams": len(streams),
     }
 
@@ -197,18 +210,27 @@ def _video_metadata(probe: Dict[str, Any]) -> Dict[str, Any]:
     except (TypeError, ValueError):
         duration = 0.0
     return {
-        "duration":  duration,
-        "width":     v.get("width"),
-        "height":    v.get("height"),
-        "fps":       _parse_fps(v.get("avg_frame_rate") or v.get("r_frame_rate")),
-        "codec":     v.get("codec_name"),
+        "duration": duration,
+        "width": v.get("width"),
+        "height": v.get("height"),
+        "fps": _parse_fps(v.get("avg_frame_rate") or v.get("r_frame_rate")),
+        "codec": v.get("codec_name"),
         "has_audio": bool(audio_streams),
     }
 
 
-# ---------------------------------------------------------------------------
-# JSON inspection
-# ---------------------------------------------------------------------------
+def _repair_json_quotes(raw: str) -> str:
+    lines: List[str] = []
+    for line in raw.splitlines():
+        m = _QUOTE_REPAIR_RE.match(line)
+        if m:
+            prefix, inner, suffix, _ = m.groups()
+            fixed_inner = re.sub(r'(?<!\\)"', r'\"', inner)
+            lines.append(f"{prefix}{fixed_inner}{suffix}")
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
 
 def _inspect_json(path: Path) -> Tuple[Optional[str], Dict[str, Any], List[str]]:
     warnings: List[str] = []
@@ -219,8 +241,12 @@ def _inspect_json(path: Path) -> Tuple[Optional[str], Dict[str, Any], List[str]]
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return None, {}, [f"json parse error at {exc.pos}: {exc.msg}"]
+    except json.JSONDecodeError:
+        try:
+            data = json.loads(_repair_json_quotes(raw))
+            warnings.append("json: auto-repaired unescaped inner quotes")
+        except json.JSONDecodeError as exc:
+            return None, {}, [f"json parse error at {exc.pos}: {exc.msg}"]
 
     if isinstance(data, dict) and isinstance(data.get("images"), list) and data["images"]:
         entries = data["images"]
@@ -231,7 +257,7 @@ def _inspect_json(path: Path) -> Tuple[Optional[str], Dict[str, Any], List[str]]
                 meta = {
                     "entries": len(entries),
                     "version": data.get("version"),
-                    "kept":    sum(1 for e in entries if e.get("keep", True)),
+                    "kept": sum(1 for e in entries if e.get("keep", True)),
                 }
                 return ROLE_EDIT_PLAN, meta, warnings
             if files_ok and not keep_present:
@@ -241,17 +267,14 @@ def _inspect_json(path: Path) -> Tuple[Optional[str], Dict[str, Any], List[str]]
             return ROLE_JSON_OTHER, {"entries": len(entries)}, warnings
 
     if isinstance(data, list) and data:
-        if all(isinstance(e, dict)
-               and "image" in e and "start" in e and "end" in e
-               for e in data):
+        if all(
+            isinstance(e, dict) and "image" in e and "start" in e and "end" in e
+            for e in data
+        ):
             return ROLE_TIMELINE_LEGACY, {"entries": len(data)}, warnings
 
     return ROLE_JSON_OTHER, {"top_type": type(data).__name__}, warnings
 
-
-# ---------------------------------------------------------------------------
-# Category decision
-# ---------------------------------------------------------------------------
 
 def _decide_category(
     ext_cat: str,
@@ -270,10 +293,6 @@ def _decide_category(
     return CATEGORY_UNKNOWN, 0.10
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def classify(path: Path) -> DetectionResult:
     path = Path(path)
     filename = path.name
@@ -285,10 +304,18 @@ def classify(path: Path) -> DetectionResult:
         size = path.stat().st_size
     except OSError as exc:
         return DetectionResult(
-            path=path, filename=filename, size=0, extension=extension,
-            extension_category=CATEGORY_UNKNOWN, header_category=CATEGORY_UNKNOWN,
-            category=CATEGORY_UNKNOWN, role=ROLE_UNKNOWN, confidence=0.0,
-            evidence=evidence, warnings=[f"stat failed: {exc}"], metadata={},
+            path=path,
+            filename=filename,
+            size=0,
+            extension=extension,
+            extension_category=CATEGORY_UNKNOWN,
+            header_category=CATEGORY_UNKNOWN,
+            category=CATEGORY_UNKNOWN,
+            role=ROLE_UNKNOWN,
+            confidence=0.0,
+            evidence=evidence,
+            warnings=[f"stat failed: {exc}"],
+            metadata={},
         )
 
     ext_specs = specs_for_filename(filename)
@@ -296,10 +323,18 @@ def classify(path: Path) -> DetectionResult:
 
     if size == 0:
         return DetectionResult(
-            path=path, filename=filename, size=0, extension=extension,
-            extension_category=ext_cat, header_category=CATEGORY_UNKNOWN,
-            category=CATEGORY_UNKNOWN, role=ROLE_UNKNOWN, confidence=0.0,
-            evidence=evidence, warnings=["empty file"], metadata={},
+            path=path,
+            filename=filename,
+            size=0,
+            extension=extension,
+            extension_category=ext_cat,
+            header_category=CATEGORY_UNKNOWN,
+            category=CATEGORY_UNKNOWN,
+            role=ROLE_UNKNOWN,
+            confidence=0.0,
+            evidence=evidence,
+            warnings=["empty file"],
+            metadata={},
         )
 
     header = _read_header(path)
@@ -353,29 +388,41 @@ def classify(path: Path) -> DetectionResult:
 
     elif category == CATEGORY_UNKNOWN:
         if _looks_like_text(header):
-            category = CATEGORY_TEXT
-            role = ROLE_TEXT
-            confidence = max(confidence, 0.40)
-            evidence.append("content: utf-8 text")
+            json_role, json_meta, _ = _inspect_json(path)
+            if json_role in (ROLE_EDIT_PLAN, ROLE_TIMELINE_LEGACY):
+                category = CATEGORY_JSON
+                role = json_role
+                metadata.update(json_meta)
+                confidence = 0.85
+                evidence.append("content: valid plan json")
+            else:
+                category = CATEGORY_TEXT
+                role = ROLE_TEXT
+                confidence = max(confidence, 0.40)
+                evidence.append("content: utf-8 text")
         else:
             role = ROLE_UNKNOWN
             warnings.append(f"unknown format (ext={extension or 'none'}, no magic match)")
 
     return DetectionResult(
-        path=path, filename=filename, size=size, extension=extension,
-        extension_category=ext_cat, header_category=hdr_cat,
-        category=category, role=role, confidence=confidence,
-        evidence=evidence, warnings=warnings, metadata=metadata,
+        path=path,
+        filename=filename,
+        size=size,
+        extension=extension,
+        extension_category=ext_cat,
+        header_category=hdr_cat,
+        category=category,
+        role=role,
+        confidence=confidence,
+        evidence=evidence,
+        warnings=warnings,
+        metadata=metadata,
     )
 
 
 def detect_many(paths: List[Path]) -> List[DetectionResult]:
     return [classify(p) for p in paths]
 
-
-# ---------------------------------------------------------------------------
-# Inventory
-# ---------------------------------------------------------------------------
 
 @dataclass
 class FileInventory:
