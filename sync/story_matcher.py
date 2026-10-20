@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from audio.sentences import Sentence, normalize_for_match
 from config.settings import MatcherConfig, load_secrets, matcher_config
@@ -36,6 +36,14 @@ class MatchedScene:
     @property
     def file(self) -> str:
         return self.image.file
+
+    @property
+    def crop(self) -> Optional[Tuple[int, int, int, int]]:
+        return getattr(self.image, "crop", None)
+
+    @property
+    def transition(self) -> Optional[str]:
+        return getattr(self.image, "transition", None)
 
     def duration(self) -> float:
         return max(0.0, self.end - self.start)
@@ -299,20 +307,124 @@ def _finalize_spans(
         next_start, next_end = out[i + 1]
 
         if next_start < curr_end:
-            # Trim overlap: advance next_start to curr_end
             next_start = max(curr_end, curr_start + 0.05)
             if next_end <= next_start:
                 next_end = next_start + 0.05
             out[i + 1][0] = next_start
             out[i + 1][1] = next_end
         elif next_start > curr_end:
-            # Hold model: extend current scene until next scene begins
             out[i][1] = next_start
 
     total_dur = max(float(duration), out[-1][0] + 0.05)
     out[-1][1] = max(total_dur, out[-1][0] + 0.05)
 
     return [(round(s, 6), round(e, 6)) for s, e in out]
+
+
+def _sentences_for_span(
+    start: float,
+    end: float,
+    sentences: Sequence[Sentence],
+) -> List[int]:
+    overlapping: List[int] = []
+    for idx, sent in enumerate(sentences):
+        overlap = min(end, float(sent.end)) - max(start, float(sent.start))
+        if overlap > 0.05:
+            overlapping.append(idx)
+    if overlapping:
+        return overlapping
+
+    mid = (start + end) * 0.5
+    best_idx = min(
+        range(len(sentences)),
+        key=lambda i: abs(((float(sentences[i].start) + float(sentences[i].end)) * 0.5) - mid),
+    )
+    return [best_idx]
+
+
+def _has_explicit_timings(images: Sequence[PlanImage]) -> bool:
+    timed = sum(
+        1
+        for img in images
+        if getattr(img, "start_time", None) is not None
+        and (
+            getattr(img, "end_time", None) is not None
+            or getattr(img, "duration", None) is not None
+        )
+    )
+    return timed >= max(1, int(len(images) * 0.8))
+
+
+def _match_from_explicit_timings(
+    images: Sequence[PlanImage],
+    sentences: Sequence[Sentence],
+    audio_duration: float,
+) -> MatchResult:
+    num_images = len(images)
+    raw_spans: List[Tuple[float, float]] = []
+    unmatched: List[int] = []
+    cursor = 0.0
+
+    for idx, img in enumerate(images):
+        st = getattr(img, "start_time", None)
+        et = getattr(img, "end_time", None)
+        dur = getattr(img, "duration", None)
+
+        if st is not None:
+            start = max(0.0, float(st))
+        else:
+            start = cursor
+            unmatched.append(idx)
+
+        if et is not None and float(et) > start:
+            end = float(et)
+        elif dur is not None and float(dur) > 0:
+            end = start + float(dur)
+        else:
+            end = start + 3.0
+            if idx not in unmatched:
+                unmatched.append(idx)
+
+        raw_spans.append((start, end))
+        cursor = end
+
+    target_duration = max(audio_duration, raw_spans[-1][1] if raw_spans else 0.1)
+    scenes: List[MatchedScene] = []
+
+    for idx, img in enumerate(images):
+        s_t, e_t = raw_spans[idx]
+        s_idxs = _sentences_for_span(s_t, e_t, sentences)
+        scenes.append(
+            MatchedScene(
+                image=img,
+                start=s_t,
+                end=e_t,
+                sentence_indices=s_idxs,
+                method="explicit",
+                confidence=1.0,
+            )
+        )
+
+    _split_equal_spans(scenes, raw_spans)
+    final_spans = _finalize_spans(raw_spans, num_images, target_duration)
+
+    for idx, (s_t, e_t) in enumerate(final_spans):
+        scenes[idx].start = s_t
+        scenes[idx].end = e_t
+        scenes[idx].sentence_indices = _sentences_for_span(s_t, e_t, sentences)
+
+    logger.info(
+        "story matching complete: entries=%d, sentences=%d, method=explicit, duration=%.2fs",
+        len(scenes),
+        len(sentences),
+        target_duration,
+    )
+    return MatchResult(
+        scenes=scenes,
+        method="explicit",
+        warnings=[],
+        unmatched=unmatched,
+    )
 
 
 def match_plan_to_transcript(
@@ -333,9 +445,15 @@ def match_plan_to_transcript(
             "plan has no kept images to match",
         )
 
+    duration = max(float(sentences[-1].end), 0.1)
+
+    if _has_explicit_timings(images):
+        if progress:
+            progress("using explicit timestamps from edit_plan.json")
+        return _match_from_explicit_timings(images, sentences, duration)
+
     cfg = matcher_config()
     warnings: List[str] = []
-    duration = max(float(sentences[-1].end), 0.1)
     num_images = len(images)
 
     assignment: Dict[int, List[int]] = {}
