@@ -567,4 +567,3 @@ def quality_label(quality: str) -> str:
     if quality in presets:
         return presets[quality].label
     return presets[default_quality()].label
-p
