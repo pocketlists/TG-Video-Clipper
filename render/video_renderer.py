@@ -16,7 +16,7 @@ from media.formats import CATEGORY_IMAGE
 from media.panel_cropper import (
     Box,
     PanelRegion,
-     assign_panels,
+    assign_panels,
     build_sequence_panel_plan,
     detect_panels,
     detect_panels_detailed,
@@ -123,14 +123,52 @@ def _scene_attr(scene, key: str, default=None):
     return getattr(scene, key, default)
 
 
+def _coerce_crop(crop_val) -> Optional[Box]:
+    if crop_val is None:
+        return None
+    if isinstance(crop_val, (list, tuple)) and len(crop_val) == 4:
+        try:
+            x1, y1, x2, y2 = (int(round(float(v))) for v in crop_val)
+            if x2 > x1 and y2 > y1:
+                return (max(0, x1), max(0, y1), x2, y2)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(crop_val, dict):
+        try:
+            if all(k in crop_val for k in ("x1", "y1", "x2", "y2")):
+                x1 = int(round(float(crop_val["x1"])))
+                y1 = int(round(float(crop_val["y1"])))
+                x2 = int(round(float(crop_val["x2"])))
+                y2 = int(round(float(crop_val["y2"])))
+            elif all(k in crop_val for k in ("x", "y", "width", "height")):
+                x1 = int(round(float(crop_val["x"])))
+                y1 = int(round(float(crop_val["y"])))
+                x2 = x1 + int(round(float(crop_val["width"])))
+                y2 = y1 + int(round(float(crop_val["height"])))
+            else:
+                return None
+            if x2 > x1 and y2 > y1:
+                return (max(0, x1), max(0, y1), x2, y2)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _scene_to_dict(scene) -> Dict:
-    return {
+    out = {
         "image_filename": str(_scene_attr(scene, "image_filename", "") or ""),
         "start": float(_scene_attr(scene, "start", 0.0)),
         "end": float(_scene_attr(scene, "end", 0.0)),
         "effect": str(_scene_attr(scene, "effect", "zoom_in") or "zoom_in"),
         "text": str(_scene_attr(scene, "text", "") or ""),
     }
+    crop = _coerce_crop(_scene_attr(scene, "crop", None))
+    if crop is not None:
+        out["crop"] = crop
+    transition = _scene_attr(scene, "transition", None)
+    if transition:
+        out["transition"] = str(transition)
+    return out
 
 
 def _assign_panel_regions(
@@ -158,7 +196,7 @@ def _assign_panel_regions(
 
 def _plan_region_shots(
     regions: List[PanelRegion],
-     fallback_path: Path,
+    fallback_path: Path,
     total_frames: int,
     fps: int,
     min_shot: float = 1.45,
@@ -310,6 +348,8 @@ def render(
                 "index": idx,
                 "filename": filename,
                 "effect": scene["effect"],
+                "crop": scene.get("crop"),
+                "transition": scene.get("transition"),
                 "start_frame": start_frame,
                 "end_frame": end_frame,
                 "total_frames": total_frames,
@@ -329,47 +369,55 @@ def render(
             checked.add(path)
         resolved.append(path)
 
-    panel_plan = build_sequence_panel_plan(resolved, temp_dir)
-    raw_panel_counts: Dict[Path, int] = {
-        p: len(detect_panels_detailed(p).panels) for p in set(resolved)
-    }
+    has_any_auto_crop = any(s.get("crop") is None for s in prepared)
+    panel_plan: Dict[Path, List[PanelRegion]] = {}
+    if has_any_auto_crop:
+        panel_plan = build_sequence_panel_plan(resolved, temp_dir)
+        raw_panel_counts: Dict[Path, int] = {
+            p: len(detect_panels_detailed(p).panels) for p in set(resolved)
+        }
 
-    # Merge scenes where image N+1 was a single cut panel already stitched into image N
-    merged_prepared: List[Dict] = []
-    merged_resolved: List[Path] = []
-    skip_next = False
+        merged_prepared: List[Dict] = []
+        merged_resolved: List[Path] = []
+        skip_next = False
 
-    for i in range(len(prepared)):
-        if skip_next:
-            skip_next = False
-            continue
+        for i in range(len(prepared)):
+            if skip_next:
+                skip_next = False
+                continue
 
-        curr_scene = dict(prepared[i])
-        curr_path = resolved[i]
+            curr_scene = dict(prepared[i])
+            curr_path = resolved[i]
 
-        if i + 1 < len(prepared):
-            next_path = resolved[i + 1]
-            curr_regions = panel_plan.get(curr_path, [])
-            stitched_next = any(
-                r.stitched_image_path is not None and next_path in r.source_paths
-                for r in curr_regions
-            )
-            if stitched_next and raw_panel_counts.get(next_path, 0) <= 1 and curr_path != next_path:
-                next_scene = prepared[i + 1]
-                curr_scene["end_frame"] = next_scene["end_frame"]
-                curr_scene["total_frames"] += next_scene["total_frames"]
-                curr_scene["duration"] = curr_scene["total_frames"] / preset.fps
-                skip_next = True
+            if (
+                i + 1 < len(prepared)
+                and curr_scene.get("crop") is None
+                and prepared[i + 1].get("crop") is None
+            ):
+                next_path = resolved[i + 1]
+                curr_regions = panel_plan.get(curr_path, [])
+                stitched_next = any(
+                    r.stitched_image_path is not None and next_path in r.source_paths
+                    for r in curr_regions
+                )
+                if stitched_next and raw_panel_counts.get(next_path, 0) <= 1 and curr_path != next_path:
+                    next_scene = prepared[i + 1]
+                    curr_scene["end_frame"] = next_scene["end_frame"]
+                    curr_scene["total_frames"] += next_scene["total_frames"]
+                    curr_scene["duration"] = curr_scene["total_frames"] / preset.fps
+                    skip_next = True
 
-        merged_prepared.append(curr_scene)
-        merged_resolved.append(curr_path)
+            merged_prepared.append(curr_scene)
+            merged_resolved.append(curr_path)
 
-    prepared = merged_prepared
-    resolved = merged_resolved
-    total = len(prepared)
+        prepared = merged_prepared
+        resolved = merged_resolved
+        total = len(prepared)
 
-    uses = Counter(resolved)
-    used: Dict[Path, int] = defaultdict(int)
+    auto_uses = Counter(
+        path for path, sc in zip(resolved, prepared) if sc.get("crop") is None
+    )
+    auto_used: Dict[Path, int] = defaultdict(int)
     clip_paths: List[Path] = []
     concat_path = temp_dir / "concat.mp4"
     global_shot_counter = 0
@@ -381,11 +429,31 @@ def render(
                 progress(f"Rendering clip {idx + 1}/{total}")
 
             image_path = resolved[idx]
-            regions = panel_plan.get(image_path) or []
-            group = _assign_panel_regions(regions, uses[image_path], used[image_path])
-            used[image_path] += 1
+            explicit_crop: Optional[Box] = scene.get("crop")
 
-            shots = _plan_region_shots(group, image_path, scene["total_frames"], preset.fps)
+            if explicit_crop is not None:
+                shots: List[Tuple[Path, Box, int, str]] = [
+                    (
+                        image_path,
+                        explicit_crop,
+                        scene["total_frames"],
+                        scene["effect"],
+                    )
+                ]
+            else:
+                regions = panel_plan.get(image_path) or []
+                group = _assign_panel_regions(
+                    regions,
+                    auto_uses[image_path],
+                    auto_used[image_path],
+                )
+                auto_used[image_path] += 1
+                shots = _plan_region_shots(
+                    group,
+                    image_path,
+                    scene["total_frames"],
+                    preset.fps,
+                )
 
             for sub, (shot_img_path, box, frames, rec_effect) in enumerate(shots):
                 clip_path = temp_dir / f"clip_{idx:04d}_{sub:02d}.mp4"
@@ -393,14 +461,19 @@ def render(
 
                 shot_w = max(1, box[2] - box[0])
                 shot_h = max(1, box[3] - box[1])
-                smart_eff = select_smart_effect(
-                    box,
-                    shot_w,
-                    shot_h,
-                    shot_index=global_shot_counter,
-                    prev_effect=last_effect,
-                )
-                effect_to_use = smart_eff or rec_effect or scene["effect"]
+
+                if explicit_crop is not None and scene.get("effect"):
+                    effect_to_use = scene["effect"]
+                else:
+                    smart_eff = select_smart_effect(
+                        box,
+                        shot_w,
+                        shot_h,
+                        shot_index=global_shot_counter,
+                        prev_effect=last_effect,
+                    )
+                    effect_to_use = smart_eff or rec_effect or scene["effect"]
+
                 last_effect = effect_to_use
                 global_shot_counter += 1
 
@@ -494,3 +567,4 @@ def quality_label(quality: str) -> str:
     if quality in presets:
         return presets[quality].label
     return presets[default_quality()].label
+p
