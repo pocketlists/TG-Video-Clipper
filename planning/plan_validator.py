@@ -9,9 +9,10 @@ errors. The caller decides whether to abort based on the report.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from media.detector import DetectionResult, classify
 from media.formats import CATEGORY_IMAGE
@@ -63,6 +64,139 @@ class ValidationReport:
         return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Chapter-number parsing + plan->disk archive remapping
+#
+# Problem: har chapter ke zip me SAME file naam hote hain (002.webp har
+# chapter me hai). Sahi image sirf zip/chapter folder se pehchani jati hai.
+#
+# Rules (user ki requirement):
+#   1. edit_plan.json me zip ka FULL naam hai aur wahi zip disk par
+#      upload hua hai  ->  bilkul waisa hi rakho, kuch change mat karo.
+#   2. edit_plan.json me full naam NAHI hai (zip field missing, ya
+#      chhota/alag naam jaise "Ch1.zip")  ->  chapter number se match
+#      karo. Uploaded zip ka naam kisi bhi format me ho sakta hai:
+#      "Monster Streaming Star_Ch1.zip", "Monster Streaming
+#      Star — Chapter 2.zip", "Chapter 3.zip", "ch-4.zip",
+#      "series_part_2.zip" ... — naam se chapter number nikalo aur us
+#      chapter ki plan entries ko wahi folder do.
+#   3. Zip kis order me upload hue, isse koi farak nahi padta —
+#      matching hamesha chapter number se hoti hai.
+# ---------------------------------------------------------------------------
+
+_CHAPTER_PATTERNS = (
+    re.compile(r"chapter[\s._-]*(\d{1,4})", re.IGNORECASE),
+    re.compile(r"(?:^|[^a-z0-9])ch[\s._-]*(\d{1,4})", re.IGNORECASE),
+    re.compile(r"episode[\s._-]*(\d{1,4})", re.IGNORECASE),
+    re.compile(r"(?:^|[^a-z0-9])ep[\s._-]*(\d{1,4})", re.IGNORECASE),
+    re.compile(r"part[\s._-]*(\d{1,4})", re.IGNORECASE),
+    re.compile(r"vol(?:ume)?[\s._-]*(\d{1,4})", re.IGNORECASE),
+    re.compile(r"[\s._-](\d{1,4})$"),
+)
+
+
+def chapter_number_from_name(name: Optional[str]) -> Optional[int]:
+    """Kisi bhi file/folder naam se chapter number nikalo, warna None.
+
+    Sirf naam (extension ke bina bhi chalega):
+        "Monster Streaming Star_Ch1"   -> 1
+        "Monster Streaming Star — Chapter 12" -> 12
+        "Chapter 3" / "ch-4" / "series_part_2" / "Story 7" -> number
+    """
+    if not name:
+        return None
+    stem = Path(str(name)).stem.strip() or str(name).strip()
+    for pattern in _CHAPTER_PATTERNS:
+        m = pattern.search(stem)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                continue
+    return None
+
+
+def remap_plan_archives(plan: EditPlan, media_dir: Path) -> List[str]:
+    """Plan ki zip->folder mapping ko disk ke asal folders se milao.
+
+    edit_plan.json FILE change nahi hoti — sirf memory me parsed plan
+    theek hota hai. Return: kiye gaye remap ki note-lines (logging ke
+    liye). Rule 1 (full naam + disk par maujud) wali entries ko hath
+    bhi nahi lagaya jata.
+    """
+    media_dir = Path(media_dir)
+    notes: List[str] = []
+    if not media_dir.is_dir():
+        return notes
+
+    # Extractor har zip ko input/<zip-ke-naam-wala-folder>/ me kholta hai.
+    top_dirs = sorted(
+        (d for d in media_dir.iterdir() if d.is_dir()),
+        key=lambda d: d.name.lower(),
+    )
+    if not top_dirs:
+        return notes  # loose images — koi zip folder hi nahi
+
+    # Rule 1 check ke liye: disk par kisi bhi level par maujud folder naam.
+    disk_dir_names = {
+        d.name.lower()
+        for d in media_dir.rglob("*")
+        if d.is_dir()
+    }
+
+    chapter_dirs: Dict[int, Path] = {}
+    unnumbered_dirs: List[Path] = []
+    for folder in top_dirs:
+        num = chapter_number_from_name(folder.name)
+        if num is None:
+            unnumbered_dirs.append(folder)
+        elif num not in chapter_dirs:
+            chapter_dirs[num] = folder
+
+    changed: Dict[Tuple[Optional[str], str, Optional[int]], int] = {}
+    for img in plan.images:
+        stem = Path(img.zip).stem.strip() if img.zip else None
+        if stem and stem.lower() in disk_dir_names:
+            continue  # Rule 1: full naam hai aur disk par hai — as-is
+
+        chapter = img.chapter
+        if chapter is None:
+            chapter = chapter_number_from_name(img.zip)
+
+        target: Optional[Path] = None
+        if chapter is not None:
+            target = chapter_dirs.get(chapter)
+            if (
+                target is None
+                and chapter == 1
+                and len(top_dirs) == 1
+                and len(unnumbered_dirs) == 1
+            ):
+                # Ek hi zip aaya hai aur uske naam me number nahi hai —
+                # use chapter 1 se shuru mano.
+                target = unnumbered_dirs[0]
+
+        if target is None:
+            continue
+
+        new_zip = f"{target.name}.zip"
+        if img.zip != new_zip:
+            key = (img.zip, new_zip, chapter)
+            changed[key] = changed.get(key, 0) + 1
+            img.zip = new_zip
+        if img.chapter is None and chapter is not None:
+            img.chapter = chapter
+
+    for (old_zip, new_zip, chapter), count in sorted(
+        changed.items(), key=lambda kv: (kv[0][2] or 0, kv[0][1])
+    ):
+        notes.append(
+            f"zip {old_zip!r} -> {new_zip!r} "
+            f"({count} entries, chapter {chapter})"
+        )
+    return notes
+
+
 class _Index:
     """
     Resolves image paths considering subdirectories (from zips/chapters),
@@ -94,33 +228,65 @@ class _Index:
         for group in self.by_prefix.values():
             group.sort(key=lambda p: p.name.lower())
 
-    def resolve(self, name: str) -> Optional[Path]:
+    def resolve(self, name: str, *, folder_strict: bool = False) -> Optional[Path]:
         name_clean = name.replace("\\", "/").lstrip("/")
-        
+
         # 1. Exact relative path
         if name_clean in self.by_relpath:
             return self.by_relpath[name_clean]
-        
+
         # 2. Case-insensitive relative path
         lower_rel = name_clean.lower()
         if lower_rel in self.by_relpath:
             return self.by_relpath[lower_rel]
-            
-        # 3. Exact filename
+
         basename = Path(name_clean).name
+
+        # 2b. Folder-aware match: naam me folder diya hai to usi folder
+        # (ya usi naam ke parent folder) wali file hi mile — dusre
+        # chapter ki same-naam wali file kabhi nahi. Ek extra wrapper
+        # folder (extraction stem) ke andar wala path bhi chalega.
+        if "/" in name_clean:
+            folder_part = Path(name_clean).parent.name.lower()
+            suffix = "/" + lower_rel
+            candidates = [
+                p for rel, p in self.by_relpath.items()
+                if rel == rel.lower() and rel.endswith(suffix)
+            ]
+            if candidates:
+                return sorted(candidates, key=lambda p: str(p).lower())[0]
+            same_folder = [
+                p for p in self.by_lower.get(basename.lower(), [])
+                if p.parent.name.lower() == folder_part
+            ]
+            if same_folder:
+                return sorted(same_folder, key=lambda p: str(p).lower())[0]
+            if folder_strict:
+                # Folder diya tha lekin us folder me file nahi mili.
+                # Dusre chapter se utha kar galat image lagane se
+                # behtar hai: missing report karo.
+                return None
+
+        # 3. Exact filename
         if basename in self.by_name:
+            if folder_strict and len(self.by_lower.get(basename.lower(), [])) > 1:
+                return None
             return self.by_name[basename]
-            
+
         # 4. Case-insensitive filename
         basename_lower = basename.lower()
         if basename_lower in self.by_lower:
+            if folder_strict and len(self.by_lower[basename_lower]) > 1:
+                return None
             return self.by_lower[basename_lower][0]
-            
+
         # 5. Numeric prefix fallback
         prefix = _numeric_prefix(basename)
         if prefix is not None and prefix in self.by_prefix:
+            if folder_strict and len(self.by_prefix[prefix]) > 1:
+                return None
             return self.by_prefix[prefix][0]
-            
+
         return None
 
     def ambiguous(self, name: str) -> Optional[List[Path]]:
@@ -171,8 +337,14 @@ def validate_plan(plan: EditPlan, media_dir: Path) -> ValidationReport:
 
     for img in kept:
         target_name = img.qualified_file
-        path = index.resolve(target_name) or index.resolve(img.file)
-        
+        # qualified_file me folder (zip/chapter) hai to STRICT resolve:
+        # bare file-naam se dusre chapter ki same-naam file kabhi match
+        # nahi hogi. Bina folder wale plan par purana fallback chalega.
+        has_folder = "/" in target_name.replace("\\", "/")
+        path = index.resolve(target_name, folder_strict=has_folder)
+        if path is None and not has_folder:
+            path = index.resolve(img.file)
+
         if path is None:
             issues.append(ValidationIssue(
                 kind="missing_file",
