@@ -1,4 +1,4 @@
-o"""
+"""
 planning/plan_validator.py
 
 Cross-checks a parsed EditPlan against the files actually present on
