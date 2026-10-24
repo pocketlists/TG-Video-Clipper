@@ -62,16 +62,49 @@ def _resolve_image(media_dir: Path, filename: str) -> Path:
     if exact.is_file():
         return exact
 
+    all_files = [c for c in media_dir.rglob("*") if c.is_file()]
+
+    # Case-insensitive RELATIVE path (folder samet) — chapter folders ke
+    # liye yehi sahi match hai, kyunki har chapter me same file-naam
+    # (002.webp) repeat hota hai.
+    lower_rel = relative.as_posix().lower()
+    for child in all_files:
+        try:
+            if child.relative_to(media_dir).as_posix().lower() == lower_rel:
+                return child
+        except ValueError:
+            continue
+
+    has_folder = len(relative.parts) > 1
+    if has_folder:
+        # Usi folder-naam (zip/chapter folder) ke andar wali file hi lo —
+        # dusre chapter ki same-naam file kabhi mat uthao.
+        folder_part = relative.parent.name.lower()
+        same_folder = [
+            c for c in all_files
+            if c.name.lower() == relative.name.lower()
+            and c.parent.name.lower() == folder_part
+        ]
+        if same_folder:
+            same_folder.sort(key=lambda path: str(path).lower())
+            return same_folder[0]
+        raise PipelineError(
+            STAGE_RENDER,
+            f"image {filename!r} not found under {media_dir}",
+            hint="Check the image filename and plan validation results.",
+        )
+
     lower_name = relative.name.lower()
-    for child in media_dir.rglob("*"):
-        if child.is_file() and child.name.lower() == lower_name:
-            return child
+    name_matches = [c for c in all_files if c.name.lower() == lower_name]
+    if name_matches:
+        name_matches.sort(key=lambda path: str(path).lower())
+        return name_matches[0]
 
     prefix = _numeric_prefix(relative.name)
     if prefix is not None:
         candidates: List[Path] = []
-        for child in media_dir.rglob("*"):
-            if not child.is_file() or child.suffix.lower() not in _IMAGE_SUFFIXES:
+        for child in all_files:
+            if child.suffix.lower() not in _IMAGE_SUFFIXES:
                 continue
             if _numeric_prefix(child.name) == prefix:
                 candidates.append(child)
