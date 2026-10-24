@@ -1,13 +1,3 @@
-"""
-planning/plan_parser.py
-
-edit_plan.json schema v1 parser.
-Supports both standard v1 plans and extended plans with explicit
-start_time, end_time, duration, and crop coordinates.
-Also includes an auto-repair pre-processor for unescaped inner quotes
-inside story_line strings.
-"""
-
 from __future__ import annotations
 
 import json
@@ -18,7 +8,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils.error_handler import PipelineError, STAGE_PLAN
-
 
 SUPPORTED_VERSIONS = (1,)
 
@@ -32,6 +21,8 @@ KNOWN_TOP_KEYS = {
 
 KNOWN_IMAGE_KEYS = {
     "file",
+    "zip",
+    "chapter",
     "description",
     "story_line",
     "keep",
@@ -74,11 +65,26 @@ class PlanImage:
     narration_id: Optional[str] = None
     transition: Optional[str] = None
     notes: str = ""
+    zip: Optional[str] = None
+    chapter: Optional[int] = None
     start_time: Optional[float] = None
     end_time: Optional[float] = None
     duration: Optional[float] = None
     crop: Optional[Tuple[int, int, int, int]] = None
     raw: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def qualified_file(self) -> str:
+        base = self.file.replace("\\", "/").lstrip("/")
+        if "/" in base:
+            return base
+        if self.zip:
+            stem = Path(self.zip).stem.strip()
+            if stem:
+                return f"{stem}/{base}"
+        if self.chapter is not None:
+            return f"chapter_{self.chapter}/{base}"
+        return base
 
 
 @dataclass
@@ -122,6 +128,28 @@ def _parse_optional_float(
             f"images[{idx}] ({file_value}) '{field_name}' must be a number"
         )
     return float(val)
+
+
+def _parse_optional_chapter(
+    val: Any,
+    idx: int,
+    file_value: str,
+) -> Optional[int]:
+    if val is None or val == "":
+        return None
+    if isinstance(val, bool):
+        raise PlanParseError(
+            f"images[{idx}] ({file_value}) 'chapter' must be an integer"
+        )
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        m = re.search(r"\d+", val)
+        if m:
+            return int(m.group(0))
+    raise PlanParseError(
+        f"images[{idx}] ({file_value}) 'chapter' must be an integer"
+    )
 
 
 def _parse_crop(
@@ -197,6 +225,16 @@ def _parse_entry(
             f"images[{idx}] missing required non-empty 'file' string"
         )
     file_value = file_value.strip()
+
+    zip_value = entry.get("zip")
+    if zip_value is not None:
+        if not isinstance(zip_value, str):
+            raise PlanParseError(
+                f"images[{idx}] ({file_value}) 'zip' must be a string"
+            )
+        zip_value = zip_value.strip() or None
+
+    chapter_value = _parse_optional_chapter(entry.get("chapter"), idx, file_value)
 
     keep = entry.get("keep", True)
     if not isinstance(keep, bool):
@@ -287,6 +325,8 @@ def _parse_entry(
         narration_id=narration_id,
         transition=transition,
         notes=notes,
+        zip=zip_value,
+        chapter=chapter_value,
         start_time=start_time,
         end_time=end_time,
         duration=duration,
@@ -356,7 +396,7 @@ def parse_plan(data: Any) -> EditPlan:
         if duplicates:
             warnings.append(f"duplicate 'order' values: {sorted(duplicates)}")
 
-    file_counts = Counter(img.file for img in images)
+    file_counts = Counter(img.qualified_file for img in images)
     duplicate_files = [name for name, count in file_counts.items() if count > 1]
     if duplicate_files:
         warnings.append(f"duplicate 'file' entries: {duplicate_files[:5]}")
@@ -370,10 +410,6 @@ def parse_plan(data: Any) -> EditPlan:
 
 
 def _repair_unescaped_quotes(text: str) -> str:
-    """
-    Repairs unescaped double-quotes inside JSON string values like
-    "story_line": "Wo sochta hai, "Ye kya hai?!"" -> escapes inner quotes.
-    """
     repaired_lines: List[str] = []
     pattern = re.compile(r'^(\s*"(?:story_line|description|notes|text)"\s*:\s*")(.*)("(\s*,?)\s*)$')
 
