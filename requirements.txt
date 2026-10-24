@@ -1,18 +1,14 @@
-
-# Telegram bot
-pyrogram==2.0.106
-TgCrypto==1.2.5
+# Telegram bot (Kurigram = maintained drop-in fork of Pyrogram; import name is still `pyrogram`)
+kurigram
+TgCrypto>=1.2.5
 requests==2.31.0
 
 # Image processing
 Pillow==10.2.0
 
-# Offline CPU audio transcription
+# Offline CPU audio transcription (torch CPU wheel is installed by the workflow first)
 openai-whisper
 
 # Gemini is retained for story/image matching only.
 google-genai>=1.30.0
 httpx>=0.27.2
-
-# Testing (optional)
-# pytest>=8.0.0
