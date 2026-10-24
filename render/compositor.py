@@ -59,7 +59,6 @@ def _trim_excess_white(crop: Image.Image) -> Image.Image:
     cw, ch = x1 - x0, y1 - y0
 
     area_ratio = (cw * ch) / float(max(1, w * h))
-    # Large images keep tight margin; smaller panels keep a thin breathing border
     pad_x = max(2, int(round(cw * (0.005 if area_ratio > 0.65 else 0.012))))
     pad_y = max(2, int(round(ch * (0.005 if area_ratio > 0.65 else 0.012))))
 
@@ -104,7 +103,6 @@ def _canvas(image_path: Path, box: Box, width: int, height: int) -> Tuple[Image.
     crop = _trim_excess_white(raw_crop)
     pw, ph = crop.size
     cw, chh = width * SS, height * SS
-    target_aspect = cw / float(chh)
     panel_aspect = pw / float(max(1, ph))
 
     is_small = (pw < 460 and ph < 460) or ((pw * ph) < (full_w * full_h * 0.18))
@@ -112,7 +110,6 @@ def _canvas(image_path: Path, box: Box, width: int, height: int) -> Tuple[Image.
     is_landscape_native = 1.25 <= panel_aspect < 1.85
     is_tall_strip = (ph / float(max(1, pw))) >= 1.22
 
-    # 1. Native landscape panels: fill or fit the 16:9 frame cleanly in landscape
     if is_landscape_native and not is_small:
         cover_scale = max(cw / float(pw), chh / float(ph))
         contain_scale = min(cw / float(pw), chh / float(ph))
@@ -122,7 +119,6 @@ def _canvas(image_path: Path, box: Box, width: int, height: int) -> Tuple[Image.
             fg = crop.resize((fw, fh), Image.LANCZOS)
             return fg, "landscape"
 
-    # 2. Short-height wide strips (e.g. 7cm x 3cm): prioritize width & center visibility
     if is_short_strip:
         target_w_fill = cw * 0.94
         min_readable_h = chh * 0.54
@@ -143,7 +139,6 @@ def _canvas(image_path: Path, box: Box, width: int, height: int) -> Tuple[Image.
         bg.paste(fg, ((canvas_w - fw) // 2, (canvas_h - fh) // 2))
         return bg, "wide_strip"
 
-    # 3. Very small panels: boost scale so artwork/dialogue is clear and centered
     if is_small:
         fit_scale = min((cw * 0.82) / float(pw), (chh * 0.86) / float(ph))
         max_cap = (MAX_UPSCALE_SMALL * cw) / float(max(pw, int(full_w * 0.55)))
@@ -159,7 +154,6 @@ def _canvas(image_path: Path, box: Box, width: int, height: int) -> Tuple[Image.
         bg.paste(fg, ((total_w - fw) // 2, (total_h - fh) // 2))
         return bg, "small_centered"
 
-    # 4. Tall vertical panels or standard portrait panels
     if is_tall_strip:
         width_fill_ratio = 0.78 if pw < full_w * 0.85 else 0.86
         scale = min(
@@ -264,6 +258,7 @@ def render_shot(
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=err)
     n = max(int(total_frames), 1)
+    
     try:
         for i in range(n):
             e = _ease(i / (n - 1)) if n > 1 else 0.0
@@ -282,6 +277,7 @@ def render_shot(
         code = proc.wait()
     except (BrokenPipeError, OSError):
         code = proc.wait()
+        
     if code != 0:
         err.seek(0)
         raise PipelineError(
