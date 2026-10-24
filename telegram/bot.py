@@ -23,7 +23,7 @@ from media.detector import DetectionResult, classify
 from media.extractor import ExtractionError, extract_archive
 from media.image_cleaner import clean_images
 from planning.plan_parser import parse_plan_file
-from planning.plan_validator import validate_plan
+from planning.plan_validator import remap_plan_archives, validate_plan
 from render.video_renderer import available_qualities, quality_label, render
 from sync.story_matcher import match_plan_to_transcript
 from sync.timeline import build_scenes_from_legacy_timeline, build_scenes_from_match
@@ -345,6 +345,17 @@ def _parse_plan(plan_path: Path, kind: str, media_dir: Path, progress: Progress)
     progress.update("validating plan")
     if kind == "edit_plan":
         plan = parse_plan_file(plan_path)
+        # edit_plan.json file ko change NAHI kiya jata — sirf memory me
+        # plan ki zip->folder mapping theek ki jati hai:
+        #  • plan me zip ka FULL naam hai aur wahi folder disk par hai
+        #    -> bilkul waisa hi rehne do (exact match).
+        #  • plan me full naam NAHI hai (zip missing / chhota naam /
+        #    alag format) -> chapter number se match karo: uploaded zip
+        #    "Monster Streaming Star_Ch1.zip", "Chapter 1.zip",
+        #    "Ch2.zip" ... jo bhi format ho, uske chapter number wala
+        #    folder us chapter ki entries ko mil jata hai.
+        for note in remap_plan_archives(plan, media_dir):
+            logger.info(f"plan remap: {note}")
         report = validate_plan(plan, media_dir)
         if not report.ok:
             raise PipelineError(
@@ -756,7 +767,17 @@ async def _serve() -> None:
 
 
 def main() -> None:
-    app.run(_serve())
+    # FIX (GitHub Actions run #53 crash):
+    #   app.run(_serve()) -> TypeError: Run.run() takes 1 positional
+    #   argument but 2 were given, aur coroutine kabhi await hi nahi hua.
+    #   Kurigram/Pyrogram ke naye version me Client.run() koi coroutine
+    #   argument NAHI leta. Isliye apna event loop khud chalao —
+    #   _serve() already app.start() / idle() / app.stop() sambhalta hai.
+    #   Ye tareeka purane aur naye dono versions par chalta hai.
+    try:
+        asyncio.run(_serve())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
