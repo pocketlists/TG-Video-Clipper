@@ -92,6 +92,8 @@ def get_session(chat_id: int) -> dict:
             "processing": False,
             "quality_prompt_sent": False,
             "pending_downloads": 0,
+            "seen_message_ids": set(),
+            "ingest_tasks": set(),
         }
         for d in (sess["input_dir"], sess["incoming_dir"], sess["temp_dir"], sess["output_dir"]):
             d.mkdir(parents=True, exist_ok=True)
@@ -106,6 +108,9 @@ def reset_session(chat_id: int) -> None:
     task = sess.get("debounce_task")
     if task and not task.done():
         task.cancel()
+    for t in list(sess.get("ingest_tasks") or ()):
+        if not t.done():
+            t.cancel()
     shutil.rmtree(sess["work_dir"], ignore_errors=True)
 
 
@@ -126,6 +131,9 @@ def build_status_text(sess: dict) -> str:
     ]
     if sess.get("pending_downloads"):
         lines.append(f"📥 Downloading: {sess['pending_downloads']} file(s) in progress")
+    seen = sess.get("seen_message_ids")
+    if seen:
+        lines.append(f"📩 Files received this session: {len(seen)}")
     if is_ready(sess) and not sess.get("quality"):
         lines.append("\n🎚️ All files received — pick a quality to start render.")
     elif is_ready(sess) and sess.get("quality"):
@@ -157,6 +165,8 @@ def target_suffix(name: str) -> str:
 
 
 async def _safe_edit(msg, text: str) -> None:
+    if msg is None:
+        return
     try:
         await msg.edit_text(text)
     except Exception as exc:
@@ -490,7 +500,13 @@ async def log_every_update(client: Client, message):
     media = getattr(message.media, "value", message.media) if message.media else None
     kind = media or ("command" if (message.text or "").startswith("/") else "text")
     chat = getattr(message.chat, "id", None)
-    logger.info(f"📩 incoming update: chat={chat} kind={kind}")
+    doc = getattr(message, "document", None) or getattr(message, "audio", None)
+    fname = getattr(doc, "file_name", None)
+    logger.info(
+        f"📩 incoming update: chat={chat} kind={kind} "
+        f"mid={getattr(message, 'id', None)} file={fname} "
+        f"group={getattr(message, 'media_group_id', None)}"
+    )
 
 
 @app.on_message(filters.command("start"))
@@ -584,8 +600,62 @@ def _max_upload_bytes() -> int:
     return INTAKE.max_upload_mb * 1024 * 1024
 
 
-@app.on_message(filters.private & (filters.document | filters.audio | filters.voice | filters.photo))
+# ---------------------------------------------------------------------------
+# Media intake — v3 hardening (bot up tha, /ping-/status chal rahe the,
+# lekin bheji gayi files register nahi ho rahi thi):
+#   1. Media handler ab group=1 me hai aur filter sirf `filters.private`
+#      hai — document/audio/voice/photo ki pehchan handler ke ANDAR
+#      hoti hai. Koi composed filter ya group-0 ka koi dusra handler
+#      (ek group me sirf EK handler chalta hai) file ko rok nahi sakta.
+#   2. Edited messages ke liye bhi wahi handler hai: album ki caption
+#      edit hone par ya file bot ke connect hone ke aas-paas bheji gayi
+#      ho to edit update se bhi file le li jati hai. Ek hi message do
+#      baar process nahi hota (seen_message_ids guard).
+#   3. Ingest ek alag task me chalta hai — 20 MB download ke dauran
+#      dispatcher dusre updates (/status, /ping) ke liye free rehta
+#      hai, aur status me "Downloading: N" sahi dikhta hai.
+#   4. Pehla "📥 Received" reply ab send_message se jata hai (reply/
+#      quote par nirbhar nahi); wo fail ho to HTTP fallback se bhi
+#      bheja jata hai, aur ingest phir bhi rukta nahi.
+# ---------------------------------------------------------------------------
+
+def _has_media(message) -> bool:
+    return bool(
+        getattr(message, "document", None)
+        or getattr(message, "audio", None)
+        or getattr(message, "voice", None)
+        or getattr(message, "photo", None)
+    )
+
+
+def _spawn_ingest(client: Client, message, *, via_edit: bool) -> None:
+    sess = get_session(message.chat.id)
+    seen = sess.setdefault("seen_message_ids", set())
+    mid = getattr(message, "id", None)
+    if mid is not None:
+        if mid in seen:
+            logger.info(f"media duplicate skipped: mid={mid} via_edit={via_edit}")
+            return
+        seen.add(mid)
+    task = asyncio.create_task(_handle_media_impl(client, message, via_edit=via_edit))
+    tasks = sess.setdefault("ingest_tasks", set())
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+@app.on_message(filters.private, group=1)
 async def handle_media(client: Client, message):
+    if _has_media(message):
+        _spawn_ingest(client, message, via_edit=False)
+
+
+@app.on_edited_message(filters.private, group=1)
+async def handle_edited_media(client: Client, message):
+    if _has_media(message):
+        _spawn_ingest(client, message, via_edit=True)
+
+
+async def _handle_media_impl(client: Client, message, *, via_edit: bool = False):
     chat_id = message.chat.id
     sess = get_session(chat_id)
 
@@ -606,10 +676,24 @@ async def handle_media(client: Client, message):
 
     safe = _safe_name(filename)
     size_mb = size / 1048576
-    logger.info(f"media received: {safe} ({size_mb:.1f} MB) chat={chat_id}")
+    logger.info(
+        f"📥 handle_media fired: {safe} ({size_mb:.1f} MB) chat={chat_id} "
+        f"mid={getattr(message, 'id', None)} via_edit={via_edit}"
+    )
 
-    # Instant acknowledgement — user ko turant pata chale ki bot ne file dekh li.
-    status = await message.reply_text(f"📥 Received: {safe} ({size_mb:.1f} MB)\nDownload shuru…", quote=True)
+    # Instant acknowledgement — user ko turant pata chale ki bot ne file
+    # dekh li. send_message (quote/reply par nirbhar nahi); fail ho to
+    # HTTP fallback; dono fail hon to bhi ingest aage badhta hai.
+    status = None
+    try:
+        status = await app.send_message(
+            chat_id, f"📥 Received: {safe} ({size_mb:.1f} MB)\nDownload shuru…"
+        )
+    except Exception as exc:
+        logger.warning(f"ack send_message failed for {safe}: {exc}")
+        await asyncio.to_thread(
+            tg_http_send, chat_id, f"📥 Received: {safe} ({size_mb:.1f} MB) — download shuru…"
+        )
 
     if _max_upload_bytes() and size > _max_upload_bytes():
         await _safe_edit(
