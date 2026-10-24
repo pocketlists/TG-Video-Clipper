@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -11,7 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import requests
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from audio.sentences import build_sentences
@@ -20,24 +22,19 @@ from config.settings import intake_config, load_secrets
 from media.detector import DetectionResult, classify
 from media.extractor import ExtractionError, extract_archive
 from media.image_cleaner import clean_images
-from planning.plan_parser import PlanParseError, parse_plan_file
+from planning.plan_parser import parse_plan_file
 from planning.plan_validator import validate_plan
 from render.video_renderer import available_qualities, quality_label, render
 from sync.story_matcher import match_plan_to_transcript
 from sync.timeline import build_scenes_from_legacy_timeline, build_scenes_from_match
-from utils.error_handler import (
-    STAGE_INTAKE,
-    STAGE_PLAN,
-    STAGE_RENDER,
-    STAGE_SYNC,
-    STAGE_UPLOAD,
-    PipelineError,
-    wrap,
-)
+from utils.error_handler import STAGE_PLAN, STAGE_SYNC, PipelineError
 from utils.logger import get_logger, setup_logging
 
 setup_logging()
 logger = get_logger("telegram.bot")
+
+if os.getenv("TG_DEBUG", "").strip() in ("1", "true", "yes"):
+    logging.getLogger("pyrogram").setLevel(logging.INFO)
 
 SECRETS = load_secrets()
 INTAKE = intake_config()
@@ -45,15 +42,33 @@ INTAKE = intake_config()
 BASE_DIR = Path(__file__).parent.parent
 WORK_ROOT = BASE_DIR / "work"
 
+IDLE_TIMEOUT_MIN = int(os.getenv("IDLE_TIMEOUT_MIN", "45") or 45)
+DOWNLOAD_TIMEOUT_S = int(os.getenv("DOWNLOAD_TIMEOUT_S", "900") or 900)
+DOWNLOAD_RETRIES = 3
+
+# in_memory=True: runner par stale .session file / AUTH_KEY problems nahi aate.
 app = Client(
     "story_video_bot",
     api_id=SECRETS.api_id,
     api_hash=SECRETS.api_hash,
     bot_token=SECRETS.bot_token,
+    in_memory=True,
+    max_concurrent_transmissions=4,
 )
 
 SESSIONS: Dict[int, dict] = {}
+STARTED_AT = time.monotonic()
+LAST_ACTIVITY = [time.monotonic()]
+CPU_SLOTS = asyncio.Semaphore(2)
 
+
+def touch() -> None:
+    LAST_ACTIVITY[0] = time.monotonic()
+
+
+# --------------------------------------------------------------------------
+# sessions / status
+# --------------------------------------------------------------------------
 
 def get_session(chat_id: int) -> dict:
     if chat_id not in SESSIONS:
@@ -76,6 +91,7 @@ def get_session(chat_id: int) -> dict:
             "debounce_task": None,
             "processing": False,
             "quality_prompt_sent": False,
+            "pending_downloads": 0,
         }
         for d in (sess["input_dir"], sess["incoming_dir"], sess["temp_dir"], sess["output_dir"]):
             d.mkdir(parents=True, exist_ok=True)
@@ -108,6 +124,8 @@ def build_status_text(sess: dict) -> str:
         f"{'✅' if sess['has_bgm'] else '➖'} Background music (optional)",
         f"{'✅ ' + sess['quality'] if sess.get('quality') else '⏳'} Video quality",
     ]
+    if sess.get("pending_downloads"):
+        lines.append(f"📥 Downloading: {sess['pending_downloads']} file(s) in progress")
     if is_ready(sess) and not sess.get("quality"):
         lines.append("\n🎚️ All files received — pick a quality to start render.")
     elif is_ready(sess) and sess.get("quality"):
@@ -125,7 +143,33 @@ def quality_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _safe_name(name: str) -> str:
+    name = Path(name).name
+    name = re.sub(r"[^\w.\-() \[\]]+", "_", name, flags=re.UNICODE).strip(" .")
+    return name[:120] or f"file_{uuid.uuid4().hex[:6]}"
+
+
+def target_suffix(name: str) -> str:
+    suffix = Path(name).suffix.lower()
+    if suffix and len(suffix) <= 5 and suffix.replace(".", "").isalnum():
+        return suffix
+    return ".bin"
+
+
+async def _safe_edit(msg, text: str) -> None:
+    try:
+        await msg.edit_text(text)
+    except Exception as exc:
+        logger.debug(f"edit skipped: {exc}")
+
+
+# --------------------------------------------------------------------------
+# progress helpers
+# --------------------------------------------------------------------------
+
 class Progress:
+    """Thread-safe progress updater used by the render pipeline thread."""
+
     def __init__(self, client: Client, chat_id: int, message_id: int, loop):
         self.client = client
         self.chat_id = chat_id
@@ -135,7 +179,9 @@ class Progress:
         self._last_text: Optional[str] = None
 
     def update(self, stage: str, detail: str = "") -> None:
+        touch()
         text = f"🎬 {stage}" + (f" — {detail}" if detail else "")
+        logger.info(text)
         if text == self._last_text:
             return
         now = time.time()
@@ -162,31 +208,90 @@ class Progress:
             logger.debug(f"final progress edit failed: {exc}")
 
 
-def notify_owner_startup() -> None:
-    if not SECRETS.owner_chat_id:
-        logger.info("OWNER_CHAT_ID not set — startup ping skipped")
-        return
+class TransferProgress:
+    """Async callback for download_media / send_video: edits one status message."""
+
+    def __init__(self, status_msg, icon: str, label: str):
+        self.msg = status_msg
+        self.icon = icon
+        self.label = label
+        self.last = 0.0
+
+    async def __call__(self, current: int, total: int) -> None:
+        touch()
+        now = time.monotonic()
+        if current < total and now - self.last < 4.0:
+            return
+        self.last = now
+        total = total or 1
+        pct = int(current * 100 / total)
+        filled = pct // 10
+        bar = "█" * filled + "░" * (10 - filled)
+        await _safe_edit(
+            self.msg,
+            f"{self.icon} {self.label}\n{bar} {pct}%  ({current / 1048576:.1f}/{total / 1048576:.1f} MB)",
+        )
+
+
+# --------------------------------------------------------------------------
+# telegram HTTP helper (works without peer cache)
+# --------------------------------------------------------------------------
+
+def tg_http_send(chat_id: int, text: str) -> None:
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{SECRETS.bot_token}/sendMessage",
-            json={
-                "chat_id": SECRETS.owner_chat_id,
-                "text": (
-                    "✅ Bot is up and running.\n\n"
-                    "Send files in any order:\n"
-                    "• ZIP of images (or loose images)\n"
-                    "• Narration audio\n"
-                    "• edit_plan.json\n\n"
-                    "When everything is present, a quality picker will appear."
-                ),
-            },
+            json={"chat_id": chat_id, "text": text},
             timeout=15,
         )
         if resp.status_code != 200:
-            logger.warning(f"startup ping non-200: {resp.status_code}")
+            logger.warning(f"telegram http send non-200: {resp.status_code} {resp.text[:200]}")
     except Exception as exc:
-        logger.warning(f"startup ping failed: {exc}")
+        logger.warning(f"telegram http send failed: {exc}")
 
+
+def notify_owner_startup(username: str) -> None:
+    if not SECRETS.owner_chat_id:
+        logger.info("OWNER_CHAT_ID not set — startup ping skipped")
+        return
+    tg_http_send(
+        SECRETS.owner_chat_id,
+        f"✅ Bot is up and running (@{username}) — Telegram connection OK.\n\n"
+        "Send files in any order:\n"
+        "• ZIP of images (or loose images)\n"
+        "• Narration audio\n"
+        "• edit_plan.json\n\n"
+        "When everything is present, a quality picker will appear.\n"
+        "Commands: /ping /status /render /reset",
+    )
+
+
+async def _heartbeat() -> None:
+    while True:
+        await asyncio.sleep(60)
+        now = time.monotonic()
+        idle_min = (now - LAST_ACTIVITY[0]) / 60
+        busy = any(s.get("processing") or s.get("pending_downloads") for s in SESSIONS.values())
+        logger.info(
+            f"💓 alive {int((now - STARTED_AT) / 60)}m | sessions={len(SESSIONS)} | "
+            f"busy={busy} | idle={idle_min:.1f}m"
+        )
+        if not busy and idle_min >= IDLE_TIMEOUT_MIN:
+            logger.warning(f"idle for {idle_min:.0f} min — shutting down to save Actions minutes")
+            if SECRETS.owner_chat_id:
+                await asyncio.to_thread(
+                    tg_http_send,
+                    SECRETS.owner_chat_id,
+                    f"💤 {IDLE_TIMEOUT_MIN} min se koi activity nahi — bot band ho gaya. "
+                    "Dobara workflow run karo.",
+                )
+            sys.stdout.flush()
+            os._exit(0)
+
+
+# --------------------------------------------------------------------------
+# auto-render orchestration
+# --------------------------------------------------------------------------
 
 def schedule_auto_render(chat_id: int) -> None:
     sess = get_session(chat_id)
@@ -211,6 +316,12 @@ async def try_start_pipeline(chat_id: int, force: bool) -> None:
     if sess["processing"]:
         if force:
             await app.send_message(chat_id, "⏳ A render is already running.")
+        return
+    if sess.get("pending_downloads"):
+        if force:
+            await app.send_message(
+                chat_id, f"⏳ {sess['pending_downloads']} file(s) abhi download ho rahi hain — thoda ruko."
+            )
         return
     if not is_ready(sess):
         if force:
@@ -288,7 +399,7 @@ def run_pipeline(sess: dict, quality: str, progress: Progress) -> Path:
 
     progress.update("rendering", f"quality={quality}")
     output_path = output_dir / "final.mp4"
-    result = render(
+    return render(
         scenes=scenes,
         narration_path=narration,
         output_path=output_path,
@@ -298,48 +409,77 @@ def run_pipeline(sess: dict, quality: str, progress: Progress) -> Path:
         bgm_path=bgm_path,
         progress=lambda s: progress.update("rendering", s),
     )
-    return result
+
+
+async def _deliver_video(chat_id: int, output_path: Path, quality: str, msg) -> None:
+    size_mb = output_path.stat().st_size / 1048576
+    caption = f"✅ Render complete ({quality}) — {size_mb:.1f} MB"
+    try:
+        await app.send_video(
+            chat_id=chat_id,
+            video=str(output_path),
+            caption=caption,
+            supports_streaming=True,
+            progress=TransferProgress(msg, "📤", f"Uploading video ({size_mb:.0f} MB)"),
+        )
+    except Exception as exc:
+        logger.exception("send_video failed; falling back to send_document")
+        await _safe_edit(msg, f"⚠️ Video upload failed ({type(exc).__name__}) — document ke taur par bhej raha hoon…")
+        await app.send_document(
+            chat_id=chat_id,
+            document=str(output_path),
+            caption=caption,
+            progress=TransferProgress(msg, "📤", f"Uploading file ({size_mb:.0f} MB)"),
+        )
+    await _safe_edit(msg, "✅ Video delivered.")
 
 
 async def start_render(chat_id: int, quality: str) -> None:
     sess = get_session(chat_id)
     sess["processing"] = True
+    touch()
+    success = False
 
     msg = await app.send_message(chat_id, f"🎬 Starting render ({quality})…")
-    progress = Progress(app, chat_id, msg.id, asyncio.get_event_loop())
+    progress = Progress(app, chat_id, msg.id, asyncio.get_running_loop())
 
     try:
         output_path = await asyncio.to_thread(run_pipeline, sess, quality, progress)
-        progress.update("uploading")
-        try:
-            await app.send_video(
-                chat_id=chat_id,
-                video=str(output_path),
-                caption=f"✅ Render complete ({quality})",
-                supports_streaming=True,
-            )
-            await progress.finish("✅ Video delivered.")
-        except Exception as exc:
-            logger.exception("video upload failed")
-            await progress.finish(
-                f"❌ Rendered, but Telegram upload failed ({type(exc).__name__}). "
-                "The file may be larger than the Bot API upload limit (50 MB). Try a lower quality."
-            )
+        await _safe_edit(msg, "📤 Render done — uploading…")
+        await _deliver_video(chat_id, output_path, quality, msg)
+        success = True
     except PipelineError as exc:
         logger.error(f"pipeline error: {exc}")
-        await progress.finish(exc.user_text())
+        await progress.finish(exc.user_text() + "\n\n🔁 Fix karke /render bhejo, ya /reset.")
     except Exception as exc:
         logger.exception("unexpected pipeline failure")
-        await progress.finish(f"❌ Unexpected error: {type(exc).__name__}: {exc}")
+        await progress.finish(
+            f"❌ Unexpected error: {type(exc).__name__}: {exc}\n\n🔁 /render se retry ya /reset."
+        )
     finally:
+        sess["processing"] = False
+        touch()
+
+    if success:
         shutil.rmtree(sess["work_dir"], ignore_errors=True)
         SESSIONS.pop(chat_id, None)
-        logger.info("one-time render finished; exiting workflow")
-        try:
-            sys.stdout.flush()
-            sys.stderr.flush()
-        finally:
-            os._exit(0)
+        logger.info("render delivered; exiting workflow")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+
+
+# --------------------------------------------------------------------------
+# handlers
+# --------------------------------------------------------------------------
+
+@app.on_message(filters.all, group=-1)
+async def log_every_update(client: Client, message):
+    touch()
+    media = getattr(message.media, "value", message.media) if message.media else None
+    kind = media or ("command" if (message.text or "").startswith("/") else "text")
+    chat = getattr(message.chat, "id", None)
+    logger.info(f"📩 incoming update: chat={chat} kind={kind}")
 
 
 @app.on_message(filters.command("start"))
@@ -355,8 +495,14 @@ async def start_handler(client: Client, message):
         "🎵 (Optional) a second audio = background music\n\n"
         "When everything is present, a quality picker will appear. "
         "Click a quality to start the render.\n\n"
-        "Commands: /status  /render  /reset"
+        "Commands: /ping  /status  /render  /reset"
     )
+
+
+@app.on_message(filters.command("ping"))
+async def ping_handler(client: Client, message):
+    up = int((time.monotonic() - STARTED_AT) / 60)
+    await message.reply_text(f"🏓 pong — bot alive, uptime {up} min")
 
 
 @app.on_message(filters.command("status") & filters.private)
@@ -377,6 +523,7 @@ async def render_handler(client: Client, message):
 
 @app.on_callback_query(filters.regex(r"^quality:"))
 async def quality_callback(client: Client, callback):
+    touch()
     chat_id = callback.message.chat.id
     quality = callback.data.split(":", 1)[1]
     if quality not in available_qualities():
@@ -395,15 +542,31 @@ async def quality_callback(client: Client, callback):
     await try_start_pipeline(chat_id, force=True)
 
 
-async def _save_document(client: Client, message, dest: Path) -> Optional[Path]:
-    try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        await client.download_media(message, file_name=str(dest))
-        return dest
-    except Exception as exc:
-        logger.exception("download failed")
-        await message.reply_text(f"❌ Download failed: {exc}")
-        return None
+async def _download(client: Client, message, dest: Path, label: str, status) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        try:
+            path = await asyncio.wait_for(
+                client.download_media(
+                    message,
+                    file_name=str(dest),
+                    progress=TransferProgress(status, "📥", f"Downloading {label}"),
+                ),
+                timeout=DOWNLOAD_TIMEOUT_S,
+            )
+            if path and Path(path).is_file():
+                return Path(path)
+            last_exc = RuntimeError("download returned no file")
+        except asyncio.TimeoutError as exc:
+            last_exc = exc
+            logger.warning(f"download timeout ({label}) attempt {attempt}/{DOWNLOAD_RETRIES}")
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(f"download error ({label}) attempt {attempt}/{DOWNLOAD_RETRIES}: {exc}")
+        await _safe_edit(status, f"🔁 Retry {attempt}/{DOWNLOAD_RETRIES}: {label}")
+        await asyncio.sleep(2 * attempt)
+    raise RuntimeError(f"{type(last_exc).__name__}: {last_exc}")
 
 
 def _max_upload_bytes() -> int:
@@ -414,7 +577,6 @@ def _max_upload_bytes() -> int:
 async def handle_media(client: Client, message):
     chat_id = message.chat.id
     sess = get_session(chat_id)
-    incoming = sess["incoming_dir"]
 
     if message.document:
         filename = message.document.file_name or f"doc_{uuid.uuid4().hex[:8]}"
@@ -431,28 +593,48 @@ async def handle_media(client: Client, message):
     else:
         return
 
+    safe = _safe_name(filename)
+    size_mb = size / 1048576
+    logger.info(f"media received: {safe} ({size_mb:.1f} MB) chat={chat_id}")
+
+    # Instant acknowledgement — user ko turant pata chale ki bot ne file dekh li.
+    status = await message.reply_text(f"📥 Received: {safe} ({size_mb:.1f} MB)\nDownload shuru…", quote=True)
+
     if _max_upload_bytes() and size > _max_upload_bytes():
-        await message.reply_text(
-            f"❌ File too large ({size // (1024*1024)} MB) — max {INTAKE.max_upload_mb} MB per upload."
+        await _safe_edit(
+            status, f"❌ File too large ({size_mb:.0f} MB) — max {INTAKE.max_upload_mb} MB per upload."
         )
         return
 
-    suffix = Path(filename).suffix.lower()
-    dl_path = incoming / f"upload_{uuid.uuid4().hex[:8]}{suffix}"
-    saved = await _save_document(client, message, dl_path)
-    if saved is None:
-        return
-
+    sess["pending_downloads"] += 1
+    saved: Optional[Path] = None
     try:
-        detection = classify(saved)
-    except Exception as exc:
-        logger.exception("classify failed")
-        await message.reply_text(f"❌ Could not inspect file: {exc}")
-        saved.unlink(missing_ok=True)
-        return
+        dest = sess["incoming_dir"] / uuid.uuid4().hex[:8] / safe
+        try:
+            saved = await _download(client, message, dest, safe, status)
+        except Exception as exc:
+            logger.error(f"download failed for {safe}: {exc}")
+            await _safe_edit(status, f"❌ Download failed: {exc}")
+            return
 
-    note = await _ingest_detection(chat_id, sess, saved, filename, detection)
-    await message.reply_text(f"{note}\n\n{build_status_text(sess)}")
+        await _safe_edit(status, f"🔎 Checking {safe}…")
+        try:
+            detection = await asyncio.to_thread(classify, saved)
+        except Exception as exc:
+            logger.exception("classify failed")
+            await _safe_edit(status, f"❌ Could not inspect file: {exc}")
+            shutil.rmtree(saved.parent, ignore_errors=True)
+            return
+
+        try:
+            note = await _ingest_detection(chat_id, sess, saved, safe, detection, status)
+        except Exception as exc:
+            logger.exception("ingest failed")
+            note = f"❌ {safe}: {type(exc).__name__}: {exc}"
+    finally:
+        sess["pending_downloads"] = max(0, sess["pending_downloads"] - 1)
+
+    await _safe_edit(status, f"{note}\n\n{build_status_text(sess)}")
     if is_ready(sess):
         schedule_auto_render(chat_id)
 
@@ -463,24 +645,29 @@ async def _ingest_detection(
     saved: Path,
     original_name: str,
     detection: DetectionResult,
+    status,
 ) -> str:
     category = detection.category
     role = detection.role
-    input_dir = sess["input_dir"]
-    incoming = sess["incoming_dir"]
+    input_dir: Path = sess["input_dir"]
+    incoming: Path = sess["incoming_dir"]
 
     if category == "archive":
-        try:
-            results = extract_archive(saved, input_dir)
-        except ExtractionError as exc:
-            return f"❌ Could not extract {original_name}: {exc}"
-        image_paths: List[Path] = [r.path for r in results if r.category == "image"]
-        if not image_paths:
-            return f"❌ Archive {original_name} contained no recognisable images."
-        report = clean_images(image_paths)
+        await _safe_edit(status, f"📦 Extracting {original_name}…")
+        async with CPU_SLOTS:
+            try:
+                results = await asyncio.to_thread(extract_archive, saved, input_dir)
+            except ExtractionError as exc:
+                return f"❌ Could not extract {original_name}: {exc}"
+            image_paths: List[Path] = [r.path for r in results if r.category == "image"]
+            if not image_paths:
+                return f"❌ Archive {original_name} contained no recognisable images."
+            await _safe_edit(status, f"🖼️ Validating {len(image_paths)} image(s) from {original_name}…")
+            report = await asyncio.to_thread(clean_images, image_paths)
+        shutil.rmtree(saved.parent, ignore_errors=True)  # zip delete — disk bachao
         sess["images_count"] += len(report.clean)
         note = (
-            f"📦 Extracted {len(image_paths)} file(s) from archive; "
+            f"📦 {original_name}: {len(image_paths)} file(s) extracted; "
             f"{len(report.clean)} validated, {len(report.rejected)} rejected."
         )
         if report.rejected:
@@ -492,7 +679,7 @@ async def _ingest_detection(
         if target.exists():
             target = input_dir / f"{target.stem}_{uuid.uuid4().hex[:6]}{target.suffix}"
         shutil.move(str(saved), str(target))
-        report = clean_images([target])
+        report = await asyncio.to_thread(clean_images, [target])
         if report.rejected:
             target.unlink(missing_ok=True)
             return f"❌ {original_name} rejected: {report.rejected[0].reason}"
@@ -550,16 +737,26 @@ async def _ingest_detection(
     return f"❌ {original_name} is not a supported input (detected: {category})."
 
 
-def target_suffix(name: str) -> str:
-    suffix = Path(name).suffix.lower()
-    if suffix and len(suffix) <= 5 and suffix.replace(".", "").isalnum():
-        return suffix
-    return ".bin"
+# --------------------------------------------------------------------------
+# entrypoint
+# --------------------------------------------------------------------------
+
+async def _serve() -> None:
+    logger.info("connecting to Telegram…")
+    await app.start()
+    me = await app.get_me()
+    logger.info(f"✅ connected as @{me.username} (id={me.id}) — waiting for updates")
+    await asyncio.to_thread(notify_owner_startup, me.username or "bot")
+    hb = asyncio.create_task(_heartbeat())
+    try:
+        await idle()
+    finally:
+        hb.cancel()
+        await app.stop()
 
 
 def main() -> None:
-    notify_owner_startup()
-    app.run()
+    app.run(_serve())
 
 
 if __name__ == "__main__":
