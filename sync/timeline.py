@@ -153,7 +153,8 @@ def _plan_image(matched: Any) -> Any:
 def _scene_file(matched: Any) -> str:
     img = _plan_image(matched)
     name = (
-        getattr(img, "file", None)
+        getattr(img, "qualified_file", None)
+        or getattr(img, "file", None)
         or getattr(img, "filename", None)
         or getattr(matched, "media_path", None)
         or getattr(matched, "file", None)
@@ -170,7 +171,7 @@ def _scene_crop(matched: Any) -> Optional[Tuple[int, int, int, int]]:
             if x2 > x1 and y2 > y1:
                 return (max(0, x1), max(0, y1), x2, y2)
         except (TypeError, ValueError):
-            return None
+            pass
     return None
 
 
@@ -247,18 +248,21 @@ def build_scenes_from_match(
         plan_img = _plan_image(matched)
         transition = getattr(plan_img, "transition", None) if plan_img else None
 
-        scenes.append(
-            RenderScene(
-                image_filename=filename,
-                start=start,
-                end=end,
-                effect=effect,
-                text=_scene_text(matched, sentences),
-                source="plan",
-                crop=_scene_crop(matched),
-                transition=transition,
-            )
+        scene = RenderScene(
+            image_filename=filename,
+            start=start,
+            end=end,
+            effect=effect,
+            text=_scene_text(matched, sentences),
+            source="plan",
+            crop=_scene_crop(matched),
+            transition=transition,
         )
+
+        if transition and transition not in ("cut", "fade", "dissolve", "flash", "shake", "slide_up"):
+            scene.warnings.append(f"transition '{transition}' might not be fully supported")
+
+        scenes.append(scene)
 
     scenes = _merge_adjacent(
         scenes,
