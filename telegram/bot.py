@@ -767,15 +767,22 @@ async def _serve() -> None:
 
 
 def main() -> None:
-    # FIX (GitHub Actions run #53 crash):
-    #   app.run(_serve()) -> TypeError: Run.run() takes 1 positional
-    #   argument but 2 were given, aur coroutine kabhi await hi nahi hua.
-    #   Kurigram/Pyrogram ke naye version me Client.run() koi coroutine
-    #   argument NAHI leta. Isliye apna event loop khud chalao —
-    #   _serve() already app.start() / idle() / app.stop() sambhalta hai.
-    #   Ye tareeka purane aur naye dono versions par chalta hai.
+    # FIX v2 (do crash, ek ke baad ek):
+    #   1) app.run(_serve()) -> TypeError: Run.run() takes 1 positional
+    #      argument but 2 were given. Kurigram/Pyrogram ke naye version
+    #      me Client.run() koi coroutine argument NAHI leta.
+    #   2) asyncio.run(_serve()) -> RuntimeError: "... got Future ...
+    #      attached to a different loop". Wajah: Client import time par
+    #      apna event loop (app.loop) cache kar leta hai, aur Telegram
+    #      session ke saare future usi loop par bante hain. asyncio.run()
+    #      ek NAYA loop banata hai — dono loop alag, isliye crash.
+    # Hal: bot ko USI loop par chalao jo Client ne pehle se rakha hai
+    # (app.loop). _serve() already app.start() / idle() / app.stop()
+    # sambhalta hai, aur ab har task/future ek hi loop par rahega.
+    loop = app.loop
+    asyncio.set_event_loop(loop)
     try:
-        asyncio.run(_serve())
+        loop.run_until_complete(_serve())
     except KeyboardInterrupt:
         pass
 
