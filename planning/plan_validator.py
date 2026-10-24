@@ -1,5 +1,6 @@
-"""
+o"""
 planning/plan_validator.py
+
 Cross-checks a parsed EditPlan against the files actually present on
 disk. Produces a ValidationReport; never raises for user-level
 problems (missing files, unprocessable images), only for programming
@@ -20,9 +21,9 @@ from utils.error_handler import PipelineError, STAGE_VALIDATE
 
 @dataclass
 class ValidationIssue:
-    kind: str                       # short code: missing_file, unprocessable, ...
+    kind: str
     message: str
-    severity: str = "error"         # "error" | "warning"
+    severity: str = "error"
     files: List[str] = field(default_factory=list)
 
 
@@ -63,42 +64,71 @@ class ValidationReport:
 
 
 class _Index:
-    """Case-sensitive first pass, case-insensitive fallback. Also exposes
-    numeric-prefix matches so plans can reference '001.jpg' when the disk
-    has '001_cover.jpg'."""
+    """
+    Resolves image paths considering subdirectories (from zips/chapters),
+    exact names, case-insensitive names, and numeric prefixes.
+    """
 
-    def __init__(self, files: List[Path]) -> None:
+    def __init__(self, files: List[Path], base_dir: Path) -> None:
+        self.by_relpath: Dict[str, Path] = {}
         self.by_name: Dict[str, Path] = {}
         self.by_lower: Dict[str, List[Path]] = {}
         self.by_prefix: Dict[int, List[Path]] = {}
+
         for path in files:
+            try:
+                rel = path.relative_to(base_dir).as_posix()
+                self.by_relpath[rel] = path
+                self.by_relpath[rel.lower()] = path
+            except ValueError:
+                pass
+
             self.by_name.setdefault(path.name, path)
             self.by_lower.setdefault(path.name.lower(), []).append(path)
             prefix = _numeric_prefix(path.name)
             if prefix is not None:
                 self.by_prefix.setdefault(prefix, []).append(path)
+
         for group in self.by_lower.values():
             group.sort(key=lambda p: p.name.lower())
         for group in self.by_prefix.values():
             group.sort(key=lambda p: p.name.lower())
 
     def resolve(self, name: str) -> Optional[Path]:
-        if name in self.by_name:
-            return self.by_name[name]
-        lower = name.lower()
-        if lower in self.by_lower:
-            return self.by_lower[lower][0]
-        prefix = _numeric_prefix(name)
+        name_clean = name.replace("\\", "/").lstrip("/")
+        
+        # 1. Exact relative path
+        if name_clean in self.by_relpath:
+            return self.by_relpath[name_clean]
+        
+        # 2. Case-insensitive relative path
+        lower_rel = name_clean.lower()
+        if lower_rel in self.by_relpath:
+            return self.by_relpath[lower_rel]
+            
+        # 3. Exact filename
+        basename = Path(name_clean).name
+        if basename in self.by_name:
+            return self.by_name[basename]
+            
+        # 4. Case-insensitive filename
+        basename_lower = basename.lower()
+        if basename_lower in self.by_lower:
+            return self.by_lower[basename_lower][0]
+            
+        # 5. Numeric prefix fallback
+        prefix = _numeric_prefix(basename)
         if prefix is not None and prefix in self.by_prefix:
             return self.by_prefix[prefix][0]
+            
         return None
 
     def ambiguous(self, name: str) -> Optional[List[Path]]:
-        lower = name.lower()
-        matches = self.by_lower.get(lower, [])
+        basename_lower = Path(name.replace("\\", "/")).name.lower()
+        matches = self.by_lower.get(basename_lower, [])
         if len(matches) > 1:
             return matches
-        prefix = _numeric_prefix(name)
+        prefix = _numeric_prefix(Path(name.replace("\\", "/")).name)
         if prefix is not None:
             matches = self.by_prefix.get(prefix, [])
             if len(matches) > 1:
@@ -132,7 +162,7 @@ def validate_plan(plan: EditPlan, media_dir: Path) -> ValidationReport:
         (p for p in media_dir.rglob("*") if p.is_file()),
         key=lambda p: p.name.lower(),
     )
-    index = _Index(disk_files)
+    index = _Index(disk_files, media_dir)
 
     kept = plan.ordered_kept()
     resolved: Dict[str, Path] = {}
@@ -140,12 +170,14 @@ def validate_plan(plan: EditPlan, media_dir: Path) -> ValidationReport:
     referenced: Set[Path] = set()
 
     for img in kept:
-        path = index.resolve(img.file)
+        target_name = img.qualified_file
+        path = index.resolve(target_name) or index.resolve(img.file)
+        
         if path is None:
             issues.append(ValidationIssue(
                 kind="missing_file",
-                message=f"plan references '{img.file}' but it is not present",
-                files=[img.file],
+                message=f"plan references '{target_name}' but it is not present",
+                files=[target_name],
             ))
             continue
 
@@ -162,19 +194,19 @@ def validate_plan(plan: EditPlan, media_dir: Path) -> ValidationReport:
             ))
 
         referenced.add(path)
-        resolved[img.file] = path
+        resolved[img.qualified_file] = path
 
         detection = classify(path)
-        detections[img.file] = detection
+        detections[img.qualified_file] = detection
 
         if detection.category != CATEGORY_IMAGE:
             issues.append(ValidationIssue(
                 kind="unprocessable",
                 message=(
-                    f"'{img.file}' resolved to '{path.name}' but was detected "
+                    f"'{target_name}' resolved to '{path.name}' but was detected "
                     f"as {detection.category}, not an image"
                 ),
-                files=[img.file, path.name],
+                files=[target_name, path.name],
             ))
             continue
 
@@ -191,9 +223,10 @@ def validate_plan(plan: EditPlan, media_dir: Path) -> ValidationReport:
 
     reused: Dict[Path, List[str]] = {}
     for img in kept:
-        path = resolved.get(img.file)
+        path = resolved.get(img.qualified_file)
         if path is not None:
-            reused.setdefault(path, []).append(img.file)
+            reused.setdefault(path, []).append(img.qualified_file)
+            
     for path, names in reused.items():
         if len(names) > 1:
             issues.append(ValidationIssue(
@@ -206,7 +239,9 @@ def validate_plan(plan: EditPlan, media_dir: Path) -> ValidationReport:
                 files=names,
             ))
 
-    kept_names_lower = {img.file.lower() for img in kept}
+    kept_names_lower = {img.qualified_file.lower() for img in kept}
+    kept_basenames_lower = {Path(img.file).name.lower() for img in kept}
+    
     for path in disk_files:
         if path in referenced:
             continue
@@ -215,8 +250,15 @@ def validate_plan(plan: EditPlan, media_dir: Path) -> ValidationReport:
                                         ".tif", ".tiff", ".avif", ".heic",
                                         ".heif", ".jxl", ".ico"}:
             continue
-        if path.name.lower() in kept_names_lower:
+            
+        try:
+            rel = path.relative_to(media_dir).as_posix().lower()
+        except ValueError:
+            rel = path.name.lower()
+            
+        if rel in kept_names_lower or path.name.lower() in kept_basenames_lower:
             continue
+            
         issues.append(ValidationIssue(
             kind="extra_image",
             message=f"'{path.name}' is on disk but not referenced by the plan",
@@ -224,7 +266,7 @@ def validate_plan(plan: EditPlan, media_dir: Path) -> ValidationReport:
             files=[path.name],
         ))
 
-    rejected_files = [img.file for img in plan.rejected()]
+    rejected_files = [img.qualified_file for img in plan.rejected()]
     if rejected_files:
         issues.append(ValidationIssue(
             kind="rejected_images",
@@ -260,7 +302,6 @@ def kept_suffixes(_: List[PlanImage]) -> Set[str]:
 
 
 def assert_valid(plan: EditPlan, media_dir: Path) -> ValidationReport:
-    """Convenience: raise PipelineError if the report has errors."""
     report = validate_plan(plan, media_dir)
     if not report.ok:
         raise PipelineError(
